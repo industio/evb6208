@@ -79,7 +79,7 @@
         name="rkbin"
 	path="rkbin"
         remote="rkbin"
-        revision="rkbin-rk3562" />
+        revision="rkbin-5.10-rk3562" />
     <project
         name="libmali"
 	path="external/libmali"
