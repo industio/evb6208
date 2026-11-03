@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+
+<manifest>
+    <!-- 
+    remote: 远程代码库配置
+    name: 远程仓库名，在使用 git clone 时默认为 origin
+    fetch: 远程仓库地址，用户和 project 节点中的 name 一起确定项目地址
+    -->
+    <!-- remote server -->
+    <remote
+        name="github"
+	fetch="https://github.com/industio" />
+    <remote
+        name="rk3562-base"
+	fetch="https://github.com/industio" />
+    <remote
+        name="uboot"
+        fetch="https://github.com/industio" />
+    <remote
+        name="buildroot"
+        fetch="https://github.com/industio" />
+    <remote
+        name="kernel"
+        fetch="https://github.com/industio" />
+    <remote
+        name="rkbin"
+        fetch="https://github.com/industio" />
+    <remote
+        name="libmali"
+        fetch="https://github.com/industio" />
+    <remote
+        name="rknn-toolkit2"
+        fetch="https://github.com/industio" />
+    <remote
+        name="rknpu2"
+        fetch="https://github.com/industio" />
+    <remote
+        name="debian"
+        fetch="https://github.com/industio" />
+  
+    <!--
+    default: 默认配置
+    remote: 默认使用的远程仓库
+    revision: 默认使用的分支
+    sync-j: 同步代码时的并发数
+    -->
+    <default
+        remote="github"
+        revision="master"
+        sync-j="1" />
+
+    <!--
+    project: 单个代码库配置
+    name: 项目地址，和指定的 remote 节点中的 fetch 一起组成仓库地址（fetch + name）
+    group: 项目所属分组，可选
+    path: 项目拉取到本地后所在目录
+    remote: 指定所在远程仓库
+    revision: 指定代码分支
+    -->
+    <!-- uboot -->
+    <project
+        name="uboot"
+        path="u-boot"
+        remote="uboot"
+        revision="2017-09-rk3562" />
+    <project
+        name="rk3562-base"
+	path="./"
+        remote="rk3562-base"
+        revision="evb6208" />
+    <project
+        name="buildroot"
+	path="buildroot"
+        remote="buildroot"
+        revision="buildroot-2021-11-rk3562" />
+    <project
+        name="kernel"
+	path="kernel-5.10"
+        remote="kernel"
+        revision="kernel-5.10.226-rk3562" />
+    <project
+        name="rkbin"
+	path="rkbin"
+        remote="rkbin"
+        revision="rkbin-5.10-rk3562" />
+    <project
+        name="libmali"
+	path="external/libmali"
+        remote="libmali"
+        revision="libmali-5.10-rk3562" />
+    <project
+	name="rknn-toolkit2"
+        path="external/rknn-toolkit2"
+        remote="rknn-toolkit2"
+        revision="rknn-toolkit2-5.10-rk3562" />
+    <project
+        name="rknpu2"
+        path="external/rknpu2"
+        remote="rknpu2"
+        revision="rknpu2-5.10-rk3562" />
+    <project
+        name="debian"
+        path="debian"
+        remote="debian"
+        revision="debian12-evb6208" />
+</manifest>
