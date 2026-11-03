@@ -67,7 +67,7 @@
         name="rk3562-base"
 	path="./"
         remote="rk3562-base"
-        revision="evb6208" />
+        revision="evb6208-debian12" />
     <project
         name="buildroot"
 	path="buildroot"
