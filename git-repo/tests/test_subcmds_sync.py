@@ -1,0 +1,3403 @@
+# Copyright (C) 2022 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unittests for the subcmds/sync.py module."""
+
+import contextlib
+import json
+import optparse
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import threading
+import time
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
+import unittest
+from unittest import mock
+import xmlrpc.client
+import xmlrpc.server
+
+import pytest
+
+import command
+from error import GitError
+from error import ManifestParseError
+from error import RepoExitError
+import manifest_xml
+from project import SyncNetworkHalfResult
+from subcmds import sync
+
+
+@pytest.mark.parametrize(
+    "cli_args, expected",
+    [
+        ([], None),
+        (["--recurse-submodules"], True),
+        (["--no-recurse-submodules"], False),
+        (["--fetch-submodules"], True),
+        (["--no-fetch-submodules"], False),
+    ],
+)
+def test_recurse_submodules_option(cli_args, expected):
+    """The submodule flags preserve an unset manifest-driven state."""
+    cmd = sync.Sync()
+
+    opts, _ = cmd.OptionParser.parse_args(cli_args)
+
+    assert opts.recurse_submodules is expected
+
+
+@pytest.mark.parametrize(
+    "old_flag, new_flag",
+    [
+        ("--fetch-submodules", "--recurse-submodules"),
+        ("--no-fetch-submodules", "--no-recurse-submodules"),
+    ],
+)
+def test_recurse_submodules_option_deprecation(old_flag, new_flag):
+    """The old submodule flags warn and direct users to their replacements."""
+    cmd = sync.Sync()
+
+    with mock.patch.object(sync.logger, "warning") as warning:
+        cmd.OptionParser.parse_args([old_flag])
+
+    warning.assert_called_once_with(
+        "%s is deprecated; use %s instead", old_flag, new_flag
+    )
+
+    assert old_flag not in cmd.OptionParser.format_help()
+
+
+@pytest.mark.parametrize(
+    "use_superproject, cli_args, result",
+    [
+        (True, ["--current-branch"], True),
+        (True, ["--no-current-branch"], True),
+        (True, [], True),
+        (False, ["--current-branch"], True),
+        (False, ["--no-current-branch"], False),
+        (False, [], None),
+    ],
+)
+def test_get_current_branch_only(use_superproject, cli_args, result):
+    """Test Sync._GetCurrentBranchOnly logic.
+
+    Sync._GetCurrentBranchOnly should return True if a superproject is
+    requested, and otherwise the value of the current_branch_only option.
+    """
+    cmd = sync.Sync()
+    opts, _ = cmd.OptionParser.parse_args(cli_args)
+
+    with mock.patch(
+        "git_superproject.UseSuperproject", return_value=use_superproject
+    ):
+        assert cmd._GetCurrentBranchOnly(opts, cmd.manifest) == result
+
+
+@pytest.mark.parametrize(
+    "cli_args, expected_groups",
+    [
+        ([], None),
+        (["-g", "groupA"], "groupA"),
+        (["--groups=groupB,groupC"], "groupB,groupC"),
+    ],
+)
+def test_groups_option_parsing(cli_args, expected_groups):
+    """Test --groups / -g option parsing."""
+    cmd = sync.Sync()
+    opts, _ = cmd.OptionParser.parse_args(cli_args)
+    assert opts.groups == expected_groups
+
+
+def _create_manifest_with_groups(topdir: Path) -> manifest_xml.XmlManifest:
+    """Create a test XmlManifest with projects assigned to various groups."""
+    repodir = topdir / ".repo"
+    manifest_dir = repodir / "manifests"
+    manifest_file = repodir / manifest_xml.MANIFEST_FILE_NAME
+
+    repodir.mkdir(exist_ok=True)
+    manifest_dir.mkdir(exist_ok=True)
+
+    gitdir = repodir / "manifests.git"
+    gitdir.mkdir(exist_ok=True)
+    (gitdir / "config").write_text(
+        """[remote "origin"]
+            url = https://localhost:0/manifest
+        """,
+        encoding="utf-8",
+    )
+
+    manifest_file.write_text(
+        """
+            <manifest>
+                <remote name="origin" fetch="http://localhost" />
+                <default remote="origin" revision="refs/heads/main" />
+                <project name="proj_g1" path="path_g1" groups="group1" />
+                <project name="proj_g2" path="path_g2" groups="group2" />
+                <project name="proj_g1_g2" path="path_g1_g2"
+                         groups="group1,group2" />
+                <project name="proj_default" path="path_default" />
+                <project name="proj_notdefault" path="path_notdefault"
+                         groups="notdefault" />
+            </manifest>
+        """,
+        encoding="utf-8",
+    )
+
+    for p in [
+        "proj_g1",
+        "proj_g2",
+        "proj_g1_g2",
+        "proj_default",
+        "proj_notdefault",
+    ]:
+        (repodir / "projects" / f"{p}.git").mkdir(parents=True, exist_ok=True)
+
+    return manifest_xml.XmlManifest(str(repodir), str(manifest_file))
+
+
+@pytest.mark.parametrize(
+    "cli_args, expected_projects",
+    [
+        (["-g", "group1"], ["proj_g1", "proj_g1_g2"]),
+        (["-g", "group2"], ["proj_g2", "proj_g1_g2"]),
+        (["-g", "group1,group2"], ["proj_g1", "proj_g1_g2", "proj_g2"]),
+        (["-g", "default,-group1"], ["proj_default", "proj_g2"]),
+        ([], ["proj_default", "proj_g1", "proj_g1_g2", "proj_g2"]),
+    ],
+)
+def test_sync_groups_manifest_filtering(
+    tmp_path: Path, cli_args, expected_projects
+):
+    """Test that repo sync -g selects only matching projects."""
+    manifest = _create_manifest_with_groups(tmp_path)
+    cmd = sync.Sync()
+    cmd.manifest = manifest
+
+    opts, args = cmd.OptionParser.parse_args(cli_args)
+    projects = cmd.GetProjects(args, groups=opts.groups, missing_ok=True)
+    project_names = sorted([p.name for p in projects])
+    assert project_names == sorted(expected_projects)
+
+
+def test_sync_update_projects_revision_id_respects_groups(tmp_path: Path):
+    """Test that _UpdateProjectsRevisionId filters projects using opt.groups."""
+    manifest = _create_manifest_with_groups(tmp_path)
+    cmd = sync.Sync()
+    cmd.manifest = manifest
+
+    superproject = mock.MagicMock()
+    superproject.UpdateProjectsRevisionId.return_value = mock.MagicMock(
+        manifest_path=None
+    )
+    manifest._superproject = superproject
+
+    opts, args = cmd.OptionParser.parse_args(["-g", "group1"])
+    opts.verbose = False
+    opts.fetch_submodules = False
+    opts.this_manifest_only = True
+    opts.local_only = False
+
+    with mock.patch.object(
+        cmd, "GetProjects", wraps=cmd.GetProjects
+    ) as spy_get_projects:
+        with mock.patch.object(cmd, "ManifestList", return_value=[manifest]):
+            cmd._UpdateProjectsRevisionId(opts, args, {}, manifest)
+            spy_get_projects.assert_called_once()
+            _, kwargs = spy_get_projects.call_args
+            assert kwargs.get("groups") == "group1"
+
+
+def test_sync_update_projects_revision_id_populates_logging_data(
+    tmp_path: Path,
+) -> None:
+    """Test that _UpdateProjectsRevisionId fills in the caller's dict."""
+    manifest = _create_manifest_with_groups(tmp_path)
+    cmd = sync.Sync()
+    cmd.manifest = manifest
+
+    superproject = mock.MagicMock()
+    superproject.UpdateProjectsRevisionId.return_value = mock.MagicMock(
+        manifest_path=None
+    )
+    manifest._superproject = superproject
+
+    opts, args = cmd.OptionParser.parse_args([])
+    opts.this_manifest_only = True
+    opts.local_only = False
+
+    superproject_logging_data = {}
+    with mock.patch.object(
+        cmd, "ManifestList", return_value=[manifest]
+    ), mock.patch.object(
+        cmd, "_ConfigureSuperproject", return_value=False
+    ), mock.patch.object(
+        sync.git_superproject, "UseSuperproject", return_value=True
+    ):
+        cmd._UpdateProjectsRevisionId(
+            opts, args, superproject_logging_data, manifest
+        )
+
+    assert superproject_logging_data == {
+        "superproject": True,
+        "haslocalmanifests": False,
+        "hassuperprojecttag": True,
+        "updatedrevisionid": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "superproject_revision, is_outer_manifest, expected_revision",
+    [
+        ("deadbeef", True, "deadbeef"),
+        ("deadbeef", False, None),
+        (None, True, None),
+    ],
+    ids=["outer_manifest", "not_outer_manifest", "no_superproject_revision"],
+)
+def test_sync_update_projects_revision_id_pins_superproject_revision(
+    tmp_path: Path,
+    superproject_revision: Optional[str],
+    is_outer_manifest: bool,
+    expected_revision: Optional[str],
+) -> None:
+    """Test that --superproject-revision is applied to a reloaded manifest.
+
+    _SyncToSuperprojectRev pins the superproject, but updating the manifest
+    project unloads the manifest, so _UpdateProjectsRevisionId must pin the
+    freshly loaded superproject again before using it.
+    """
+    manifest = _create_manifest_with_groups(tmp_path)
+    cmd = sync.Sync()
+    cmd.manifest = manifest
+    cmd.outer_manifest = manifest if is_outer_manifest else mock.MagicMock()
+
+    # Simulate the state after a manifest reload: a new, unpinned superproject.
+    superproject = mock.MagicMock()
+    superproject.UpdateProjectsRevisionId.return_value = mock.MagicMock(
+        manifest_path=None, fatal=False
+    )
+    manifest._superproject = superproject
+
+    opts, args = cmd.OptionParser.parse_args([])
+    opts.verbose = False
+    opts.this_manifest_only = True
+    opts.local_only = False
+    opts.superproject_revision = superproject_revision
+
+    with mock.patch.object(
+        cmd, "ManifestList", return_value=[manifest]
+    ), mock.patch.object(
+        sync.git_superproject, "UseSuperproject", return_value=True
+    ), mock.patch.object(
+        sync.git_superproject, "PrintMessages", return_value=False
+    ):
+        cmd._UpdateProjectsRevisionId(opts, args, {}, manifest)
+
+    if expected_revision is not None:
+        superproject.SetRevisionId.assert_called_once_with(expected_revision)
+        # The pin must be in place before the superproject is used.
+        method_calls = [name for name, _, _ in superproject.mock_calls]
+        assert method_calls.index("SetRevisionId") < method_calls.index(
+            "UpdateProjectsRevisionId"
+        )
+    else:
+        superproject.SetRevisionId.assert_not_called()
+    superproject.UpdateProjectsRevisionId.assert_called_once()
+
+
+def test_sync_update_projects_revision_id_logs_without_superproject_tag(
+    tmp_path: Path,
+) -> None:
+    """Test that sync state is recorded when the manifest has no superproject.
+
+    SyncAnalysisState never removes keys, so values from an earlier sync would
+    otherwise persist in the config.
+    """
+    manifest = _create_manifest_with_groups(tmp_path)
+    cmd = sync.Sync()
+    cmd.manifest = manifest
+
+    opts, args = cmd.OptionParser.parse_args([])
+    opts.this_manifest_only = True
+    opts.local_only = False
+
+    superproject_logging_data = {}
+    cmd._UpdateProjectsRevisionId(
+        opts, args, superproject_logging_data, manifest
+    )
+
+    assert superproject_logging_data == {
+        "superproject": False,
+        "haslocalmanifests": False,
+        "hassuperprojecttag": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "generate_manpages, expected_default",
+    [
+        (False, "7; based on number of CPU cores"),
+        (True, "based on number of CPU cores"),
+    ],
+    ids=("interactive", "manpages"),
+)
+def test_jobs_checkout_help_default(
+    generate_manpages: bool,
+    expected_default: str,
+) -> None:
+    """Test checkout-jobs default help in interactive and manpage modes."""
+    with mock.patch.object(sync, "DEFAULT_LOCAL_JOBS", 7), mock.patch.object(
+        command,
+        "GENERATE_MANPAGES",
+        generate_manpages,
+    ):
+        help_text = " ".join(sync.Sync().OptionParser.format_help().split())
+
+    assert f"defaults to --jobs or {expected_default}" in help_text
+    if generate_manpages:
+        assert "defaults to --jobs or 7" not in help_text
+
+
+# Used to patch os.cpu_count() for reliable results.
+OS_CPU_COUNT = 24
+
+
+@pytest.mark.parametrize(
+    "argv, jobs_manifest, jobs, jobs_net, jobs_check",
+    [
+        # No user or manifest settings.
+        ([], None, OS_CPU_COUNT, 1, command.DEFAULT_LOCAL_JOBS),
+        # No user settings, so manifest settings control.
+        ([], 3, 3, 3, 3),
+        # User settings, but no manifest.
+        (["--jobs=4"], None, 4, 4, 4),
+        (["--jobs=4", "--jobs-network=5"], None, 4, 5, 4),
+        (["--jobs=4", "--jobs-checkout=6"], None, 4, 4, 6),
+        (["--jobs=4", "--jobs-network=5", "--jobs-checkout=6"], None, 4, 5, 6),
+        (
+            ["--jobs-network=5"],
+            None,
+            OS_CPU_COUNT,
+            5,
+            command.DEFAULT_LOCAL_JOBS,
+        ),
+        (["--jobs-checkout=6"], None, OS_CPU_COUNT, 1, 6),
+        (["--jobs-network=5", "--jobs-checkout=6"], None, OS_CPU_COUNT, 5, 6),
+        # User settings with manifest settings.
+        (["--jobs=4"], 3, 4, 4, 4),
+        (["--jobs=4", "--jobs-network=5"], 3, 4, 5, 4),
+        (["--jobs=4", "--jobs-checkout=6"], 3, 4, 4, 6),
+        (["--jobs=4", "--jobs-network=5", "--jobs-checkout=6"], 3, 4, 5, 6),
+        (["--jobs-network=5"], 3, 3, 5, 3),
+        (["--jobs-checkout=6"], 3, 3, 3, 6),
+        (["--jobs-network=5", "--jobs-checkout=6"], 3, 3, 5, 6),
+        # Settings that exceed rlimits get capped.
+        (["--jobs=1000000"], None, 83, 83, 83),
+        ([], 1000000, 83, 83, 83),
+    ],
+)
+def test_cli_jobs(argv, jobs_manifest, jobs, jobs_net, jobs_check):
+    """Tests --jobs option behavior."""
+    mp = mock.MagicMock()
+    mp.manifest.default.sync_j = jobs_manifest
+    mp.manifest.default.sync_j_max = None
+
+    cmd = sync.Sync()
+    opts, args = cmd.OptionParser.parse_args(argv)
+    cmd.ValidateOptions(opts, args)
+
+    with mock.patch.object(sync, "_rlimit_nofile", return_value=(256, 256)):
+        with mock.patch.object(os, "cpu_count", return_value=OS_CPU_COUNT):
+            cmd._ValidateOptionsWithManifest(opts, mp)
+            assert opts.jobs == jobs
+            assert opts.jobs_network == jobs_net
+            assert opts.jobs_checkout == jobs_check
+
+
+@pytest.mark.parametrize(
+    "argv, jobs_manifest, jobs_manifest_max, jobs, jobs_net, jobs_check",
+    [
+        (["--jobs=10"], None, 5, 5, 5, 5),
+        (["--jobs=10", "--jobs-network=10"], None, 5, 5, 5, 5),
+        (["--jobs=10", "--jobs-checkout=10"], None, 5, 5, 5, 5),
+    ],
+)
+def test_cli_jobs_sync_j_max(
+    argv, jobs_manifest, jobs_manifest_max, jobs, jobs_net, jobs_check
+):
+    """Tests --jobs option behavior with sync-j-max."""
+    mp = mock.MagicMock()
+    mp.manifest.default.sync_j = jobs_manifest
+    mp.manifest.default.sync_j_max = jobs_manifest_max
+
+    cmd = sync.Sync()
+    opts, args = cmd.OptionParser.parse_args(argv)
+    cmd.ValidateOptions(opts, args)
+
+    with mock.patch.object(sync, "_rlimit_nofile", return_value=(256, 256)):
+        with mock.patch.object(os, "cpu_count", return_value=OS_CPU_COUNT):
+            cmd._ValidateOptionsWithManifest(opts, mp)
+            assert opts.jobs == jobs
+            assert opts.jobs_network == jobs_net
+            assert opts.jobs_checkout == jobs_check
+
+
+@pytest.mark.parametrize(
+    "argv, sync_smartsync_manifest, expected_smart_sync, expected_implicit",
+    [
+        ([], False, False, False),
+        ([], None, False, False),
+        ([], True, True, True),
+        (["-s"], False, True, False),
+        (["--smart-sync"], False, True, False),
+        (["--smart-sync"], True, True, False),
+        (["--no-smart-sync"], True, False, False),
+        (["--no-smart-sync"], False, False, False),
+        (["-t", "tag123"], True, False, False),
+        (["--smart-tag=tag123"], True, False, False),
+        (["-m", "other.xml"], True, False, False),
+        (["--manifest-name=other.xml"], True, False, False),
+        (["-l"], True, False, False),
+        (["--local-only"], True, False, False),
+        (["--nmu"], True, True, True),
+        (["--no-manifest-update"], True, True, True),
+        (["--nmu"], False, False, False),
+        (["--superproject-revision=abc"], True, False, False),
+        (["-s", "-l"], True, True, False),
+        (["-s", "--nmu"], True, True, False),
+        (["-s", "--superproject-revision=abc"], True, True, False),
+    ],
+)
+def test_cli_smart_sync(
+    argv: List[str],
+    sync_smartsync_manifest: Optional[bool],
+    expected_smart_sync: bool,
+    expected_implicit: bool,
+) -> None:
+    """Tests --smart-sync and --no-smart-sync option behavior with manifest
+    default.
+    """
+    manifest = mock.MagicMock()
+    manifest.default.sync_smartsync = sync_smartsync_manifest
+
+    cmd = sync.Sync(manifest=manifest)
+    opts, args = cmd.OptionParser.parse_args(argv)
+    cmd.ValidateOptions(opts, args)
+    implicit = cmd._ResolveSmartSyncOption(opts, manifest)
+    assert opts.smart_sync == expected_smart_sync
+    assert implicit == expected_implicit
+
+
+@pytest.mark.parametrize(
+    "argv, user_pref, sync_smartsync_manifest, expected_smart_sync, "
+    "expected_implicit",
+    [
+        # sync.smartsync=false: never smart sync unless -s/-t is given.
+        ([], False, True, False, False),
+        ([], False, False, False, False),
+        (["-s"], False, True, True, False),
+        (["--smart-sync"], False, False, True, False),
+        (["-t", "tag123"], False, True, False, False),
+        (["--nmu"], False, True, False, False),
+        # sync.smartsync=true: like -s, counted as explicit, not implicit.
+        ([], True, False, True, False),
+        ([], True, True, True, False),
+        (["--nmu"], True, False, True, False),
+        (["--no-smart-sync"], True, True, False, False),
+        (["-t", "tag123"], True, False, False, False),
+        (["-m", "other.xml"], True, False, False, False),
+        (["-l"], True, False, False, False),
+        (["--superproject-revision=abc"], True, False, False, False),
+        # sync.smartsync unset: manifest default applies as before.
+        ([], None, True, True, True),
+        ([], None, False, False, False),
+    ],
+)
+def test_user_config_smart_sync(
+    argv: List[str],
+    user_pref: Optional[bool],
+    sync_smartsync_manifest: bool,
+    expected_smart_sync: bool,
+    expected_implicit: bool,
+) -> None:
+    """Tests the sync.smartsync user setting against CLI and manifest."""
+    manifest = mock.MagicMock()
+    manifest.default.sync_smartsync = sync_smartsync_manifest
+
+    user_cfg = mock.MagicMock()
+    user_cfg.GetBoolean.return_value = user_pref
+
+    cmd = sync.Sync(manifest=manifest)
+    opts, args = cmd.OptionParser.parse_args(argv)
+    cmd.ValidateOptions(opts, args)
+    with mock.patch.object(sync.RepoConfig, "ForUser", return_value=user_cfg):
+        implicit = cmd._ResolveSmartSyncOption(opts, manifest)
+    user_cfg.GetBoolean.assert_called_once_with("sync.smartsync")
+    assert opts.smart_sync == expected_smart_sync
+    assert implicit == expected_implicit
+
+
+@pytest.mark.parametrize(
+    "value, expected_smart_sync",
+    [("true", True), ("false", False), ("yes", True), ("no", False)],
+)
+def test_user_config_smart_sync_from_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_home_dir: Path,
+    value: str,
+    expected_smart_sync: bool,
+) -> None:
+    """Tests that sync.smartsync is read from ~/.repoconfig/config."""
+    # ForUser() caches its instance process-wide; make it pick up this HOME.
+    monkeypatch.setattr(sync.RepoConfig, "_ForUser", None)
+    monkeypatch.delenv("REPO_CONFIG_DIR", raising=False)
+    cfg_dir = tmp_home_dir / ".repoconfig"
+    cfg_dir.mkdir()
+    (cfg_dir / "config").write_text(f"[sync]\n\tsmartsync = {value}\n")
+
+    manifest = mock.MagicMock()
+    # Set the manifest default to the opposite so we know the user config won.
+    manifest.default.sync_smartsync = not expected_smart_sync
+
+    cmd = sync.Sync(manifest=manifest)
+    opts, args = cmd.OptionParser.parse_args([])
+    cmd.ValidateOptions(opts, args)
+    assert cmd._ResolveSmartSyncOption(opts, manifest) is False
+    assert opts.smart_sync == expected_smart_sync
+
+
+@pytest.mark.parametrize(
+    "argv, user_pref, sync_smartsync_manifest, expected_exception",
+    [
+        (["-u", "user", "-p", "pass"], None, False, sync.SmartSyncError),
+        (["-u", "user", "-p", "pass"], None, True, None),
+        (["-s", "-u", "user", "-p", "pass"], None, False, None),
+        (["-t", "tag", "-u", "user", "-p", "pass"], None, False, None),
+        (
+            ["--no-smart-sync", "-u", "user", "-p", "pass"],
+            None,
+            True,
+            sync.SmartSyncError,
+        ),
+        (["-l", "-u", "user", "-p", "pass"], None, True, sync.SmartSyncError),
+        (["--nmu", "-u", "user", "-p", "pass"], None, True, None),
+        (
+            ["--nmu", "-u", "user", "-p", "pass"],
+            None,
+            False,
+            sync.SmartSyncError,
+        ),
+        (["-s", "-l", "-u", "user", "-p", "pass"], None, True, None),
+        (["-u", "user"], None, False, SystemExit),
+        (["-p", "pass"], None, False, SystemExit),
+        # -u/-p are accepted when smart sync comes from sync.smartsync=true...
+        (["-u", "user", "-p", "pass"], True, False, None),
+        # ...and rejected when sync.smartsync=false drops the manifest default.
+        (["-u", "user", "-p", "pass"], False, True, sync.SmartSyncError),
+    ],
+)
+def test_cli_manifest_server_credentials(
+    argv: List[str],
+    user_pref: Optional[bool],
+    sync_smartsync_manifest: bool,
+    expected_exception: Optional[Type[BaseException]],
+) -> None:
+    """Tests -u and -p validation rules."""
+    manifest = mock.MagicMock()
+    manifest.default.sync_smartsync = sync_smartsync_manifest
+
+    user_cfg = mock.MagicMock()
+    user_cfg.GetBoolean.return_value = user_pref
+
+    cmd = sync.Sync(manifest=manifest)
+    opts, args = cmd.OptionParser.parse_args(argv)
+    with mock.patch.object(sync.RepoConfig, "ForUser", return_value=user_cfg):
+        if expected_exception:
+            with pytest.raises(expected_exception):
+                cmd.ValidateOptions(opts, args)
+                cmd._ResolveSmartSyncOption(opts, manifest)
+        else:
+            cmd.ValidateOptions(opts, args)
+            cmd._ResolveSmartSyncOption(opts, manifest)
+
+
+class LocalSyncState(unittest.TestCase):
+    """Tests for LocalSyncState."""
+
+    _TIME = 10
+
+    def setUp(self):
+        """Common setup."""
+        self.topdir = tempfile.mkdtemp("LocalSyncState")
+        self.repodir = os.path.join(self.topdir, ".repo")
+        os.makedirs(self.repodir)
+
+        self.manifest = mock.MagicMock(
+            topdir=self.topdir,
+            repodir=self.repodir,
+            repoProject=FakeProject(".repo/repo"),
+        )
+        self.manifest.outer_client = self.manifest
+        self.state = self._new_state()
+
+    def tearDown(self):
+        """Common teardown."""
+        shutil.rmtree(self.topdir)
+
+    def _new_state(self, time=_TIME):
+        with mock.patch("time.time", return_value=time):
+            return sync.LocalSyncState(self.manifest)
+
+    def test_set(self):
+        """Times are set."""
+        p = FakeProject("projA")
+        self.state.SetFetchTime(p)
+        self.state.SetCheckoutTime(p)
+        self.assertEqual(self.state.GetFetchTime(p), self._TIME)
+        self.assertEqual(self.state.GetCheckoutTime(p), self._TIME)
+
+    def test_update(self):
+        """Times are updated."""
+        with open(self.state._path, "w") as f:
+            f.write(
+                """
+            {
+              "projB": {
+                "last_fetch": 5,
+                "last_checkout": 7
+              }
+            }
+            """
+            )
+
+        # Initialize state to read from the new file.
+        self.state = self._new_state()
+        projA = FakeProject("projA")
+        projB = FakeProject("projB")
+        self.assertEqual(self.state.GetFetchTime(projA), None)
+        self.assertEqual(self.state.GetFetchTime(projB), 5)
+        self.assertEqual(self.state.GetCheckoutTime(projB), 7)
+
+        self.state.SetFetchTime(projA)
+        self.state.SetFetchTime(projB)
+        self.assertEqual(self.state.GetFetchTime(projA), self._TIME)
+        self.assertEqual(self.state.GetFetchTime(projB), self._TIME)
+        self.assertEqual(self.state.GetCheckoutTime(projB), 7)
+
+    def test_same_relpath_projects_keep_separate_state(self) -> None:
+        """Projects with the same relpath keep separate sync state."""
+        outer = FakeProject("proj")
+        child = FakeProject("proj", path_prefix="sub")
+
+        self.state.SetFetchTime(outer)
+        self.state.Save()
+
+        self.state = self._new_state(self._TIME + 1)
+        self.state.SetFetchTime(child)
+
+        self.assertEqual(self.state.GetFetchTime(outer), self._TIME)
+        self.assertEqual(
+            self.state.GetFetchTime(child),
+            self._TIME + 1,
+        )
+
+    def test_partial_sync_with_same_relpath_projects(self) -> None:
+        """Projects with the same relpath keep independent partial sync."""
+        outer = FakeProject("proj")
+        child = FakeProject("proj", path_prefix="sub")
+
+        for project in (outer, child):
+            self.state.SetFetchTime(project)
+            self.state.SetCheckoutTime(project)
+        self.state.Save()
+        self.assertFalse(self.state.IsPartiallySynced())
+
+        self.state = self._new_state(self._TIME + 1)
+        self.state.SetFetchTime(outer)
+        self.state.SetCheckoutTime(outer)
+
+        self.assertTrue(self.state.IsPartiallySynced())
+
+    def test_save_to_file(self):
+        """Data is saved under repodir."""
+        p = FakeProject("projA")
+        self.state.SetFetchTime(p)
+        self.state.Save()
+        self.assertEqual(
+            os.listdir(self.repodir), [".repo_localsyncstate.json"]
+        )
+
+    def test_partial_sync(self):
+        """Partial sync state is detected."""
+        with open(self.state._path, "w") as f:
+            f.write(
+                """
+            {
+              "projA": {
+                "last_fetch": 5,
+                "last_checkout": 5
+              },
+              "projB": {
+                "last_fetch": 5,
+                "last_checkout": 5
+              }
+            }
+            """
+            )
+
+        # Initialize state to read from the new file.
+        self.state = self._new_state()
+        projB = FakeProject("projB")
+        self.assertEqual(self.state.IsPartiallySynced(), False)
+
+        self.state.SetFetchTime(projB)
+        self.state.SetCheckoutTime(projB)
+        self.assertEqual(self.state.IsPartiallySynced(), True)
+
+    def test_ignore_repo_project(self):
+        """Sync data for repo project is ignored when checking partial sync."""
+        p = FakeProject("projA")
+        self.state.SetFetchTime(p)
+        self.state.SetCheckoutTime(p)
+        self.state.SetFetchTime(self.manifest.repoProject)
+        self.state.Save()
+        self.assertEqual(self.state.IsPartiallySynced(), False)
+
+        self.state = self._new_state(self._TIME + 1)
+        self.state.SetFetchTime(self.manifest.repoProject)
+        self.assertEqual(
+            self.state.GetFetchTime(self.manifest.repoProject), self._TIME + 1
+        )
+        self.assertEqual(self.state.GetFetchTime(p), self._TIME)
+        self.assertEqual(self.state.IsPartiallySynced(), False)
+
+    def test_nonexistent_project(self):
+        """Unsaved projects don't have data."""
+        p = FakeProject("projC")
+        self.assertEqual(self.state.GetFetchTime(p), None)
+        self.assertEqual(self.state.GetCheckoutTime(p), None)
+
+    def test_prune_removed_projects(self):
+        """Removed projects are pruned."""
+        with open(self.state._path, "w") as f:
+            f.write(
+                """
+            {
+              "projA": {
+                "last_fetch": 5
+              },
+              "projB": {
+                "last_fetch": 7
+              }
+            }
+            """
+            )
+
+        def mock_exists(path):
+            if "projA" in path:
+                return False
+            return True
+
+        projA = FakeProject("projA")
+        projB = FakeProject("projB")
+        self.state = self._new_state()
+        self.assertEqual(self.state.GetFetchTime(projA), 5)
+        self.assertEqual(self.state.GetFetchTime(projB), 7)
+        with mock.patch("os.path.exists", side_effect=mock_exists):
+            self.state.PruneRemovedProjects()
+        self.assertIsNone(self.state.GetFetchTime(projA))
+
+        self.state = self._new_state()
+        self.assertIsNone(self.state.GetFetchTime(projA))
+        self.assertEqual(self.state.GetFetchTime(projB), 7)
+
+    def test_prune_keeps_submanifest_project(self) -> None:
+        """Existing submanifest projects are not pruned."""
+        project = FakeProject("proj", path_prefix="sub")
+        os.makedirs(
+            os.path.join(self.topdir, "sub", "proj", ".git"),
+        )
+
+        self.state.SetFetchTime(project)
+        self.state.PruneRemovedProjects()
+
+        self.assertEqual(self.state.GetFetchTime(project), self._TIME)
+
+    def test_prune_from_submanifest_keeps_project(self) -> None:
+        """Existing projects are not pruned during a submanifest sync."""
+        child_topdir = os.path.join(self.topdir, "sub")
+        project = FakeProject("proj", path_prefix="sub")
+        os.makedirs(os.path.join(child_topdir, "proj", ".git"))
+
+        child_manifest = mock.MagicMock(
+            topdir=child_topdir,
+            repodir=self.repodir,
+            outer_client=self.manifest,
+        )
+
+        with mock.patch("time.time", return_value=self._TIME):
+            state = sync.LocalSyncState(child_manifest)
+
+        state.SetFetchTime(project)
+        state.PruneRemovedProjects()
+
+        self.assertEqual(state.GetFetchTime(project), self._TIME)
+
+    def test_prune_removed_and_symlinked_projects(self):
+        """Removed projects that still exists on disk as symlink are pruned."""
+        with open(self.state._path, "w") as f:
+            f.write(
+                """
+            {
+              "projA": {
+                "last_fetch": 5
+              },
+              "projB": {
+                "last_fetch": 7
+              }
+            }
+            """
+            )
+
+        def mock_exists(path):
+            return True
+
+        def mock_islink(path):
+            if "projB" in path:
+                return True
+            return False
+
+        projA = FakeProject("projA")
+        projB = FakeProject("projB")
+        self.state = self._new_state()
+        self.assertEqual(self.state.GetFetchTime(projA), 5)
+        self.assertEqual(self.state.GetFetchTime(projB), 7)
+        with mock.patch("os.path.exists", side_effect=mock_exists):
+            with mock.patch("os.path.islink", side_effect=mock_islink):
+                self.state.PruneRemovedProjects()
+        self.assertIsNone(self.state.GetFetchTime(projB))
+
+        self.state = self._new_state()
+        self.assertIsNone(self.state.GetFetchTime(projB))
+        self.assertEqual(self.state.GetFetchTime(projA), 5)
+
+
+class FakeProject:
+    def __init__(
+        self,
+        relpath: str,
+        name: Optional[str] = None,
+        objdir: Optional[str] = None,
+        parent: Optional["FakeProject"] = None,
+        is_derived: bool = False,
+        revisionId: Optional[str] = None,
+        gitlink_path: Optional[str] = None,
+        path_prefix: str = "",
+    ) -> None:
+        self.relpath = relpath
+        self.path_prefix = path_prefix
+        self.name = name or relpath
+        self.objdir = objdir or relpath
+        self.worktree = relpath
+        self.parent = parent
+        self.is_derived = is_derived
+        self.revisionId = revisionId
+        self.gitlink_path = gitlink_path
+
+        self.use_git_worktrees = False
+        self.UseAlternates = False
+        self.UseReprojectCmd = False
+        self.manifest = mock.MagicMock()
+        self.manifest.GetProjectsWithName.return_value = [self]
+        self.config = mock.MagicMock()
+        self.EnableRepositoryExtension = mock.MagicMock()
+
+    @property
+    def Derived(self) -> bool:
+        return self.is_derived
+
+    def SetRevision(
+        self, revisionExpr: str, revisionId: Optional[str] = None
+    ) -> None:
+        self.revisionExpr = revisionExpr
+        self.revisionId = revisionId or revisionExpr
+
+    def RelPath(self, local: bool = True) -> str:
+        if local:
+            return self.relpath
+        return os.path.join(self.path_prefix, self.relpath)
+
+    def __str__(self):
+        return f"project: {self.relpath}"
+
+    def __repr__(self):
+        return str(self)
+
+
+class SafeCheckoutOrder(unittest.TestCase):
+    def test_no_nested(self):
+        p_f = FakeProject("f")
+        p_foo = FakeProject("foo")
+        out = sync._SafeCheckoutOrder([p_f, p_foo])
+        self.assertEqual(out, [[p_f, p_foo]])
+
+    def test_basic_nested(self):
+        p_foo = p_foo = FakeProject("foo")
+        p_foo_bar = FakeProject("foo/bar")
+        out = sync._SafeCheckoutOrder([p_foo, p_foo_bar])
+        self.assertEqual(out, [[p_foo], [p_foo_bar]])
+
+    def test_complex_nested(self):
+        p_foo = FakeProject("foo")
+        p_foobar = FakeProject("foobar")
+        p_foo_dash_bar = FakeProject("foo-bar")
+        p_foo_bar = FakeProject("foo/bar")
+        p_foo_bar_baz_baq = FakeProject("foo/bar/baz/baq")
+        p_bar = FakeProject("bar")
+        out = sync._SafeCheckoutOrder(
+            [
+                p_foo_bar_baz_baq,
+                p_foo,
+                p_foobar,
+                p_foo_dash_bar,
+                p_foo_bar,
+                p_bar,
+            ]
+        )
+        self.assertEqual(
+            out,
+            [
+                [p_bar, p_foo, p_foo_dash_bar, p_foobar],
+                [p_foo_bar],
+                [p_foo_bar_baz_baq],
+            ],
+        )
+
+    def test_sibling_submodules_with_shared_parent_are_serialized(self):
+        parent = mock.Mock(worktree="/worktree/parent")
+        other_parent = mock.Mock(worktree="/worktree/other")
+        p_parent = FakeProject("parent")
+        p_other = FakeProject("other")
+        p_parent_sub1 = FakeProject("parent/sub1")
+        p_parent_sub1.parent = parent
+        p_parent_sub2 = FakeProject("parent/sub2")
+        p_parent_sub2.parent = parent
+        p_other_sub = FakeProject("other/sub")
+        p_other_sub.parent = other_parent
+
+        out = sync._SafeCheckoutOrder(
+            [p_parent_sub2, p_other_sub, p_parent, p_parent_sub1, p_other]
+        )
+
+        self.assertEqual(
+            out,
+            [
+                [p_other, p_parent],
+                [p_other_sub, p_parent_sub1],
+                [p_parent_sub2],
+            ],
+        )
+
+    def test_nested_submodules_respect_delayed_parent_level(self):
+        parent = mock.Mock(worktree="/worktree/parent")
+        sub1 = mock.Mock(worktree="/worktree/parent/sub1")
+        sub2 = mock.Mock(worktree="/worktree/parent/sub2")
+        p_parent = FakeProject("parent")
+        p_parent_sub1 = FakeProject("parent/sub1")
+        p_parent_sub1.parent = parent
+        p_parent_sub1_nested = FakeProject("parent/sub1/nested")
+        p_parent_sub1_nested.parent = sub1
+        p_parent_sub2 = FakeProject("parent/sub2")
+        p_parent_sub2.parent = parent
+        p_parent_sub2_nested = FakeProject("parent/sub2/nested")
+        p_parent_sub2_nested.parent = sub2
+
+        out = sync._SafeCheckoutOrder(
+            [
+                p_parent_sub2_nested,
+                p_parent_sub2,
+                p_parent_sub1_nested,
+                p_parent,
+                p_parent_sub1,
+            ]
+        )
+
+        self.assertEqual(
+            out,
+            [
+                [p_parent],
+                [p_parent_sub1],
+                [p_parent_sub1_nested, p_parent_sub2],
+                [p_parent_sub2_nested],
+            ],
+        )
+
+
+class NestedProjects(unittest.TestCase):
+    def test_flat_manifest(self) -> None:
+        p_foo = FakeProject("foo")
+        p_foo_bar = FakeProject("foo-bar")
+        self.assertEqual(sync._NestedProjects([p_foo, p_foo_bar]), [])
+
+    def test_nested_paths(self) -> None:
+        p_foo = FakeProject("foo")
+        p_foo_bar = FakeProject("foo/bar")
+        p_foo_bar_baz = FakeProject("foo/bar/baz")
+        self.assertEqual(
+            sync._NestedProjects([p_foo_bar_baz, p_foo, p_foo_bar]),
+            [p_foo_bar, p_foo_bar_baz],
+        )
+
+    def test_submodule_of_a_parent(self) -> None:
+        parent = FakeProject("foo")
+        sub = FakeProject("foo/sub", parent=parent, is_derived=True)
+        self.assertEqual(sync._NestedProjects([parent, sub]), [sub])
+
+
+class ParentFirstBatches(unittest.TestCase):
+    def test_no_submodules(self) -> None:
+        p_a = FakeProject("a")
+        p_a_b = FakeProject("a/b")
+        out = sync._ParentFirstBatches([p_a, p_a_b])
+        self.assertEqual(out, [[p_a, p_a_b]])
+
+    def test_submodules_follow_their_parent(self) -> None:
+        p_a = FakeProject("a")
+        p_a_b = FakeProject("a/b", parent=p_a, is_derived=True)
+        p_a_b_c = FakeProject("a/b/c", parent=p_a_b, is_derived=True)
+        out = sync._ParentFirstBatches([p_a_b_c, p_a, p_a_b])
+        self.assertEqual(out, [[p_a], [p_a_b], [p_a_b_c]])
+
+
+class RefreshDerivedRevisions(unittest.TestCase):
+    def _parent_with_submodules(self, **gitlinks: str) -> FakeProject:
+        p_a = FakeProject("a")
+        p_a.GetSubmoduleRevisions = mock.Mock(return_value=gitlinks)
+        return p_a
+
+    def _submodule(self, parent: FakeProject, path: str) -> FakeProject:
+        return FakeProject(
+            f"a/{path}", parent=parent, is_derived=True, gitlink_path=path
+        )
+
+    def test_reads_each_parent_once(self) -> None:
+        p_a = self._parent_with_submodules(b="beef1234", c="cafe1234")
+        p_a_b = self._submodule(p_a, "b")
+        p_a_c = self._submodule(p_a, "c")
+
+        sync._RefreshDerivedRevisions([p_a, p_a_b, p_a_c])
+
+        p_a.GetSubmoduleRevisions.assert_called_once_with()
+        self.assertEqual(p_a_b.revisionId, "beef1234")
+        self.assertEqual(p_a_c.revisionId, "cafe1234")
+
+    def test_reuses_gitlinks_read_for_an_earlier_level(self) -> None:
+        p_a = self._parent_with_submodules(b="beef1234", c="cafe1234")
+        p_a_b = self._submodule(p_a, "b")
+        p_a_c = self._submodule(p_a, "c")
+        submodule_revisions = {}
+
+        sync._RefreshDerivedRevisions([p_a_b], submodule_revisions)
+        sync._RefreshDerivedRevisions([p_a_c], submodule_revisions)
+
+        p_a.GetSubmoduleRevisions.assert_called_once_with()
+        self.assertEqual(p_a_c.revisionId, "cafe1234")
+
+    def test_tells_apart_projects_with_the_same_path(self) -> None:
+        # Paths are relative to their own (sub)manifest, so two projects can
+        # share one.
+        first = self._parent_with_submodules(b="beef1234")
+        second = self._parent_with_submodules(b="cafe1234")
+        first_sub = self._submodule(first, "b")
+        second_sub = self._submodule(second, "b")
+        submodule_revisions = {}
+
+        sync._RefreshDerivedRevisions([first_sub], submodule_revisions)
+        sync._RefreshDerivedRevisions([second_sub], submodule_revisions)
+
+        self.assertEqual(first_sub.revisionId, "beef1234")
+        self.assertEqual(second_sub.revisionId, "cafe1234")
+
+    def test_ignores_projects_from_the_manifest(self) -> None:
+        p_a = self._parent_with_submodules()
+
+        sync._RefreshDerivedRevisions([p_a])
+
+        p_a.GetSubmoduleRevisions.assert_not_called()
+
+    def test_reports_submodules_removed_from_their_parent(self) -> None:
+        p_a = self._parent_with_submodules(b="beef1234")
+        p_a_c = self._submodule(p_a, "c")
+
+        removed = sync._RefreshDerivedRevisions([p_a, p_a_c])
+
+        self.assertEqual(removed, [p_a_c])
+
+    def test_keeps_submodules_of_an_unreadable_parent(self) -> None:
+        p_a = FakeProject("a")
+        p_a.GetSubmoduleRevisions = mock.Mock(return_value=None)
+        p_a_b = FakeProject(
+            "a/b",
+            parent=p_a,
+            is_derived=True,
+            revisionId="stale",
+            gitlink_path="b",
+        )
+
+        removed = sync._RefreshDerivedRevisions([p_a, p_a_b])
+
+        self.assertEqual(removed, [])
+        self.assertEqual(p_a_b.revisionId, "stale")
+
+
+class FetchParentFirst(unittest.TestCase):
+    def test_submodules_are_fetched_after_their_parent(self) -> None:
+        cmd = sync.Sync()
+        cmd._fetch_times = mock.Mock()
+        cmd._fetch_times.Get = mock.Mock(return_value=0)
+
+        calls = []
+        p_a = FakeProject("a")
+
+        def fake_read() -> Dict[str, str]:
+            calls.append(("read gitlinks of", p_a.relpath))
+            return {"b": "beef1234"}
+
+        p_a.GetSubmoduleRevisions = mock.Mock(side_effect=fake_read)
+        p_a_b = FakeProject(
+            "a/b", parent=p_a, is_derived=True, gitlink_path="b"
+        )
+
+        def fake_fetch(
+            projects: List[FakeProject], *_args: object
+        ) -> sync._FetchResult:
+            calls.append(("fetch", [p.relpath for p in projects]))
+            return sync._FetchResult(True, {p.objdir for p in projects})
+
+        opt = mock.Mock(fail_fast=False)
+        with mock.patch.object(cmd, "_Fetch", side_effect=fake_fetch):
+            result = cmd._FetchParentFirst([p_a_b, p_a], opt, None, None, [])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.projects, {"a", "a/b"})
+        self.assertEqual(
+            calls,
+            [
+                ("fetch", ["a"]),
+                ("read gitlinks of", "a"),
+                ("fetch", ["a/b"]),
+            ],
+        )
+
+
+class WithoutProjects(unittest.TestCase):
+    def test_drops_the_unwanted_projects(self) -> None:
+        p_a = FakeProject("a")
+        p_a_b = FakeProject("a/b")
+        self.assertEqual(sync._WithoutProjects([p_a, p_a_b], [p_a_b]), [p_a])
+        self.assertEqual(sync._WithoutProjects([p_a, p_a_b], []), [p_a, p_a_b])
+
+    def test_keeps_projects_with_the_same_path(self) -> None:
+        # Paths are relative to their own (sub)manifest, so two projects can
+        # share one.
+        first = FakeProject("a/b")
+        second = FakeProject("a/b")
+        self.assertEqual(
+            sync._WithoutProjects([first, second], [second]), [first]
+        )
+
+
+class Chunksize(unittest.TestCase):
+    """Tests for _chunksize."""
+
+    def test_single_project(self):
+        """Single project."""
+        self.assertEqual(sync._chunksize(1, 1), 1)
+
+    def test_low_project_count(self):
+        """Multiple projects, low number of projects to sync."""
+        self.assertEqual(sync._chunksize(10, 1), 10)
+        self.assertEqual(sync._chunksize(10, 2), 5)
+        self.assertEqual(sync._chunksize(10, 4), 2)
+        self.assertEqual(sync._chunksize(10, 8), 1)
+        self.assertEqual(sync._chunksize(10, 16), 1)
+
+    def test_high_project_count(self):
+        """Multiple projects, high number of projects to sync."""
+        self.assertEqual(sync._chunksize(2800, 1), 32)
+        self.assertEqual(sync._chunksize(2800, 16), 32)
+        self.assertEqual(sync._chunksize(2800, 32), 32)
+        self.assertEqual(sync._chunksize(2800, 64), 32)
+        self.assertEqual(sync._chunksize(2800, 128), 21)
+
+
+class GetPreciousObjectsState(unittest.TestCase):
+    """Tests for _GetPreciousObjectsState."""
+
+    def setUp(self):
+        """Common setup."""
+        self.cmd = sync.Sync()
+        self.project = p = mock.MagicMock(
+            use_git_worktrees=False, UseAlternates=False
+        )
+        p.manifest.GetProjectsWithName.return_value = [p]
+
+        self.opt = mock.Mock(spec_set=["this_manifest_only"])
+        self.opt.this_manifest_only = False
+
+    def test_worktrees(self):
+        """False for worktrees."""
+        self.project.use_git_worktrees = True
+        self.assertFalse(
+            self.cmd._GetPreciousObjectsState(self.project, self.opt)
+        )
+
+    def test_not_shared(self):
+        """Singleton project."""
+        self.assertFalse(
+            self.cmd._GetPreciousObjectsState(self.project, self.opt)
+        )
+
+    def test_shared(self):
+        """Shared project."""
+        self.project.manifest.GetProjectsWithName.return_value = [
+            self.project,
+            self.project,
+        ]
+        self.assertTrue(
+            self.cmd._GetPreciousObjectsState(self.project, self.opt)
+        )
+
+    def test_shared_with_alternates(self):
+        """Shared project, with alternates."""
+        self.project.manifest.GetProjectsWithName.return_value = [
+            self.project,
+            self.project,
+        ]
+        self.project.UseAlternates = True
+        self.assertFalse(
+            self.cmd._GetPreciousObjectsState(self.project, self.opt)
+        )
+
+    def test_not_found(self):
+        """Project not found in manifest."""
+        self.project.manifest.GetProjectsWithName.return_value = []
+        self.assertFalse(
+            self.cmd._GetPreciousObjectsState(self.project, self.opt)
+        )
+
+
+class KeyboardInterruptTest(unittest.TestCase):
+    """Tests for KeyboardInterrupt handling in Sync operations."""
+
+    def setUp(self):
+        self.project = mock.MagicMock(name="project")
+        self.project.name = "project"
+        self.project.relpath = "proj"
+        self.project.manifest.IsArchive = False
+        self.opt = mock.Mock()
+        self.opt.quiet = True
+        self.opt.verbose = False
+        self.opt.tags = False
+
+        self.sync_dict = {}
+
+        self.get_parallel_context_mock = {
+            "projects": [self.project],
+            "sync_dict": self.sync_dict,
+            "ssh_proxy": None,
+        }
+
+    @mock.patch("subcmds.sync.Sync.is_multiprocessing_active")
+    def test_fetch_one_keyboard_interrupt_main_process(self, mock_is_active):
+        """Test that _FetchOne re-raises KeyboardInterrupt if not worker."""
+        mock_is_active.return_value = False
+        self.project.Sync_NetworkHalf.side_effect = KeyboardInterrupt()
+
+        with mock.patch.object(
+            sync.Sync,
+            "get_parallel_context",
+            return_value=self.get_parallel_context_mock,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                sync.Sync._FetchOne(self.opt, 0)
+
+    @mock.patch("subcmds.sync.Sync.is_multiprocessing_active")
+    def test_fetch_one_keyboard_interrupt_worker_process(self, mock_is_active):
+        """Test that _FetchOne suppresses KeyboardInterrupt in workers."""
+        mock_is_active.return_value = True
+        self.project.Sync_NetworkHalf.side_effect = KeyboardInterrupt()
+
+        with mock.patch.object(
+            sync.Sync,
+            "get_parallel_context",
+            return_value=self.get_parallel_context_mock,
+        ):
+            result = sync.Sync._FetchOne(self.opt, 0)
+            self.assertFalse(result.success)
+
+
+class CheckForBloatedProjects(unittest.TestCase):
+    """Tests for Sync._CheckForBloatedProjects."""
+
+    def setUp(self):
+        self.cmd = sync.Sync()
+        self.opt = mock.Mock()
+        self.opt.quiet = True
+        self.opt.jobs = 1
+        self.opt.network_only = False
+        self.tempdirobj = tempfile.TemporaryDirectory(prefix="repo_tests")
+        self.addCleanup(self.tempdirobj.cleanup)
+        self.project = mock.MagicMock(clone_depth="1")
+        self.project.name = "project"
+        self.project.Exists = True
+        self.project.worktree = self.tempdirobj.name
+        self.project.stateless_prune_needed = False
+        self.cmd.git_event_log = mock.MagicMock()
+        self.cmd._bloated_projects = []
+
+    def test_one_project_uses_dirty_and_head(self) -> None:
+        """A project whose HEAD left the manifest revision is measured."""
+        self.project.GetDirtyAndHead.return_value = (False, "local")
+        self.project.GetRevisionId.return_value = "manifest"
+        self.project.bare_git.count_objects.return_value = (
+            "packs: 0\nsize-pack: 0\nsize-garbage: 0\n"
+        )
+        with mock.patch.object(
+            sync.Sync,
+            "get_parallel_context",
+            return_value={"projects": [self.project]},
+        ):
+            self.assertIsNone(self.cmd._CheckOneBloatedProject(0))
+
+        self.project.GetDirtyAndHead.assert_called_once_with()
+        self.project.bare_git.count_objects.assert_called_once_with("-v")
+
+    def test_one_dirty_project_is_measured(self) -> None:
+        """A dirty project is measured even if HEAD matches the manifest."""
+        self.project.GetDirtyAndHead.return_value = (True, "local")
+        self.project.GetRevisionId.return_value = "local"
+        self.project.bare_git.count_objects.return_value = (
+            "packs: 0\nsize-pack: 0\nsize-garbage: 0\n"
+        )
+        with mock.patch.object(
+            sync.Sync,
+            "get_parallel_context",
+            return_value={"projects": [self.project]},
+        ):
+            self.assertIsNone(self.cmd._CheckOneBloatedProject(0))
+
+        self.project.bare_git.count_objects.assert_called_once_with("-v")
+
+    def test_one_unborn_project_skips_bloat_check(self) -> None:
+        """A project without a resolvable HEAD is skipped."""
+        self.project.GetDirtyAndHead.return_value = (True, None)
+
+        with mock.patch.object(
+            sync.Sync,
+            "get_parallel_context",
+            return_value={"projects": [self.project]},
+        ):
+            self.assertIsNone(self.cmd._CheckOneBloatedProject(0))
+
+        self.project.GetRevisionId.assert_not_called()
+        self.project.bare_git.count_objects.assert_not_called()
+
+    @mock.patch("subcmds.sync.git_require")
+    def test_git_version_unsupported(self, mock_git_require):
+        """Test that it returns early if git version is unsupported."""
+        mock_git_require.return_value = False
+        self.cmd._CheckForBloatedProjects([self.project], self.opt)
+        self.assertFalse(self.cmd.git_event_log.ErrorEvent.called)
+
+    @mock.patch("subcmds.sync.git_require")
+    def test_no_projects(self, mock_git_require):
+        """Test that it returns early if no projects have clone_depth."""
+        mock_git_require.return_value = True
+        self.project.clone_depth = None
+        self.cmd._CheckForBloatedProjects([self.project], self.opt)
+        self.assertFalse(self.cmd.git_event_log.ErrorEvent.called)
+
+    @mock.patch("subcmds.sync.git_require", return_value=True)
+    @mock.patch("subcmds.sync.Progress")
+    def test_network_only_skips_check(
+        self, mock_progress: mock.Mock, mock_git_require: mock.Mock
+    ) -> None:
+        """--network-only doesn't read any worktree state."""
+        self.opt.network_only = True
+        self.cmd.ExecuteInParallel = mock.Mock()
+
+        self.cmd._CheckForBloatedProjects([self.project], self.opt)
+
+        mock_progress.assert_not_called()
+        self.cmd.ExecuteInParallel.assert_not_called()
+
+    @mock.patch("subcmds.sync.git_require", return_value=True)
+    @mock.patch("subcmds.sync.Progress")
+    def test_projects_without_worktree_excluded(
+        self, mock_progress: mock.Mock, mock_git_require: mock.Mock
+    ) -> None:
+        """Projects without a checked-out worktree are never scanned."""
+        self.cmd.ExecuteInParallel = mock.Mock()
+        missing = os.path.join(self.tempdirobj.name, "missing")
+        for attr, value in (
+            ("worktree", missing),
+            ("worktree", None),
+            ("Exists", False),
+        ):
+            with self.subTest(attr=attr, value=value):
+                mock_progress.reset_mock()
+                self.cmd.ExecuteInParallel.reset_mock()
+                with mock.patch.object(self.project, attr, value):
+                    self.cmd._CheckForBloatedProjects([self.project], self.opt)
+
+                mock_progress.assert_not_called()
+                self.cmd.ExecuteInParallel.assert_not_called()
+
+    @mock.patch("subcmds.sync.git_require")
+    @mock.patch("subcmds.sync.Progress")
+    def test_bloated_project_found(self, mock_progress, mock_git_require):
+        """Test that it adds project to _bloated_projects."""
+        mock_git_require.return_value = True
+
+        self.cmd.get_parallel_context = mock.Mock(
+            return_value={"projects": [self.project]}
+        )
+
+        def mock_execute_in_parallel(
+            jobs, func, work_items, callback, **kwargs
+        ):
+            callback(None, mock.Mock(), ["project"])
+            return True
+
+        self.cmd.ExecuteInParallel = mock_execute_in_parallel
+
+        with mock.patch.object(self.cmd, "ParallelContext"):
+            self.cmd._CheckForBloatedProjects([self.project], self.opt)
+
+        self.assertEqual(self.cmd._bloated_projects, ["project"])
+
+    @mock.patch("subcmds.sync.git_require")
+    @mock.patch("subcmds.sync.Progress")
+    def test_stateless_prune_excluded(self, mock_progress, mock_git_require):
+        """Test that projects pruned for stateless sync are excluded."""
+        mock_git_require.return_value = True
+        self.project.stateless_prune_needed = True
+
+        self.cmd.ExecuteInParallel = mock.Mock()
+
+        with mock.patch.object(self.cmd, "ParallelContext"):
+            self.cmd._CheckForBloatedProjects([self.project], self.opt)
+
+        self.assertFalse(self.cmd.ExecuteInParallel.called)
+        self.assertEqual(self.cmd._bloated_projects, [])
+
+
+class GCProjectsTest(unittest.TestCase):
+    """Tests for Sync._GCProjects."""
+
+    def setUp(self):
+        self.cmd = sync.Sync()
+        self.opt = mock.Mock()
+        self.opt.quiet = True
+        self.opt.auto_gc = True
+        self.opt.jobs = 1
+        self.project = mock.MagicMock()
+        self.project.name = "project"
+        self.project.objdir = "objdir"
+        self.project.gitdir = "gitdir"
+        self.project.bare_git = mock.MagicMock()
+        self.project.bare_git._project = self.project
+        self.cmd.git_event_log = mock.MagicMock()
+
+    @mock.patch("subcmds.sync.Progress")
+    def test_GCProjects_skip_gc(self, mock_progress):
+        """Test that it skips GC if opt.auto_gc is False."""
+        self.opt.auto_gc = False
+        with mock.patch.object(
+            sync.Sync, "_SetPreciousObjectsState"
+        ) as mock_set_state:
+            self.cmd._GCProjects([self.project], self.opt, None)
+            mock_set_state.assert_called_once_with(self.project, self.opt)
+        self.assertFalse(self.project.bare_git.gc.called)
+
+    @mock.patch("subcmds.sync.Progress")
+    def test_GCProjects_sequential(self, mock_progress):
+        """Test sequential GC (jobs < 2)."""
+        with mock.patch.object(sync.Sync, "_SetPreciousObjectsState"):
+            self.cmd._GCProjects([self.project], self.opt, None)
+        self.project.bare_git.gc.assert_called_once_with(
+            "--auto", config={"gc.autoDetach": "false"}
+        )
+        # Verify that gc.autoDetach was not permanently set in config.
+        for call in self.project.config.SetString.call_args_list:
+            self.assertNotEqual(call.args[0], "gc.autoDetach")
+
+    @mock.patch("subcmds.sync.Progress")
+    def test_GCProjects_parallel(self, mock_progress):
+        """Test parallel GC (jobs >= 2)."""
+        self.opt.jobs = 2
+        with mock.patch.object(sync.Sync, "_SetPreciousObjectsState"):
+            with mock.patch("subcmds.sync._threading.Thread") as mock_thread:
+                mock_t = mock.MagicMock()
+                mock_thread.return_value = mock_t
+                err_event = mock.Mock()
+                err_event.is_set.return_value = False
+                self.cmd._GCProjects([self.project], self.opt, err_event)
+
+        self.assertTrue(mock_thread.called)
+
+
+class SyncCommand(unittest.TestCase):
+    """Tests for cmd.Execute."""
+
+    def setUp(self):
+        """Common setup."""
+        self.repodir = tempfile.mkdtemp(".repo")
+        self.manifest = manifest = mock.MagicMock(
+            repodir=self.repodir,
+        )
+
+        git_event_log = mock.MagicMock(ErrorEvent=mock.Mock(return_value=None))
+        self.outer_client = outer_client = mock.MagicMock()
+        outer_client.manifest.IsArchive = True
+        manifest.manifestProject.worktree = "worktree_path/"
+        manifest.repoProject.LastFetch = time.time()
+        self.sync_network_half_error = None
+        self.sync_local_half_error = None
+        self.cmd = sync.Sync(
+            manifest=manifest,
+            outer_client=outer_client,
+            git_event_log=git_event_log,
+        )
+
+        def Sync_NetworkHalf(*args, **kwargs):
+            return SyncNetworkHalfResult(True, self.sync_network_half_error)
+
+        def Sync_LocalHalf(*args, **kwargs):
+            if self.sync_local_half_error:
+                raise self.sync_local_half_error
+
+        self.project = p = mock.MagicMock(
+            use_git_worktrees=False,
+            UseAlternates=False,
+            UseReprojectCmd=False,
+            name="project",
+            relpath="rel_path",
+            parent=None,
+            Sync_NetworkHalf=Sync_NetworkHalf,
+            Sync_LocalHalf=Sync_LocalHalf,
+            RelPath=mock.Mock(return_value="rel_path"),
+        )
+        p.manifest.GetProjectsWithName.return_value = [p]
+
+        mock.patch.object(
+            sync,
+            "_PostRepoFetch",
+            return_value=None,
+        ).start()
+
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=[self.project]
+        ).start()
+
+        opt, _ = self.cmd.OptionParser.parse_args([])
+        opt.clone_bundle = False
+        opt.jobs = 4
+        opt.quiet = True
+        opt.use_superproject = False
+        opt.current_branch_only = True
+        opt.optimized_fetch = True
+        opt.retry_fetches = 1
+        opt.prune = False
+        opt.auto_gc = False
+        opt.repo_verify = False
+        self.opt = opt
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+    def test_command_exit_error(self):
+        """Ensure unsuccessful commands raise expected errors."""
+        self.sync_network_half_error = GitError(
+            "sync_network_half_error error", project=self.project
+        )
+        self.sync_local_half_error = GitError(
+            "sync_local_half_error", project=self.project
+        )
+        with self.assertRaises(RepoExitError) as e:
+            self.cmd.Execute(self.opt, [])
+            self.assertIn(self.sync_local_half_error, e.aggregate_errors)
+            self.assertIn(self.sync_network_half_error, e.aggregate_errors)
+
+    def test_groups_passed_to_get_projects(self):
+        """Ensure Execute passes opt.groups to GetProjects."""
+        self.opt.groups = "my_group"
+        self.opt.mp_update = False
+        with mock.patch.object(self.cmd, "_UpdateRepoProject"):
+            with mock.patch.object(self.cmd, "_ValidateOptionsWithManifest"):
+                with mock.patch.object(self.cmd, "_SyncInterleaved"):
+                    with mock.patch.object(self.cmd, "_RunPostSyncHook"):
+                        self.cmd.Execute(self.opt, [])
+        self.cmd.GetProjects.assert_called()
+        _, kwargs = self.cmd.GetProjects.call_args
+        self.assertEqual(kwargs.get("groups"), "my_group")
+
+    def _ExecuteUntilSync(
+        self, args: List[str]
+    ) -> Tuple[mock.MagicMock, mock.MagicMock]:
+        """Run Execute up to the sync itself, returning the sync mocks."""
+        self.opt.mp_update = False
+        with contextlib.ExitStack() as stack:
+            for name in (
+                "_UpdateRepoProject",
+                "_UpdateProjectsRevisionId",
+                "_ValidateOptionsWithManifest",
+                "_RunPostSyncHook",
+            ):
+                stack.enter_context(mock.patch.object(self.cmd, name))
+            phased = stack.enter_context(
+                mock.patch.object(self.cmd, "_SyncPhased")
+            )
+            interleaved = stack.enter_context(
+                mock.patch.object(self.cmd, "_SyncInterleaved")
+            )
+            self.cmd.Execute(self.opt, args)
+        return phased, interleaved
+
+    def test_reproject_cmd_allows_a_flat_manifest(self) -> None:
+        """Ensure repo.reprojectcmd syncs a manifest without nesting."""
+        self.project.UseReprojectCmd = True
+        phased, interleaved = self._ExecuteUntilSync([])
+        self.assertTrue(phased.called or interleaved.called)
+
+    def test_reproject_cmd_rejects_nested_projects(self) -> None:
+        """Ensure repo.reprojectcmd fails a manifest with nested projects."""
+        p_foo = FakeProject("foo")
+        p_foo_bar = FakeProject("foo/bar")
+        p_foo.UseReprojectCmd = p_foo_bar.UseReprojectCmd = True
+        self.cmd.GetProjects.return_value = [p_foo, p_foo_bar]
+        with self.assertRaises(sync.SyncError) as e:
+            self._ExecuteUntilSync([])
+        self.assertIn("foo/bar", str(e.exception))
+        self.assertNotIn(" - foo\n", str(e.exception))
+
+    def test_reproject_cmd_rejects_a_submodule(self) -> None:
+        """Ensure repo.reprojectcmd fails a manifest with a submodule."""
+        p_foo = FakeProject("foo")
+        p_sub = FakeProject("foo/sub", parent=p_foo, is_derived=True)
+        p_foo.UseReprojectCmd = p_sub.UseReprojectCmd = True
+        self.cmd.GetProjects.return_value = [p_foo, p_sub]
+        with self.assertRaises(sync.SyncError) as e:
+            self._ExecuteUntilSync([])
+        self.assertIn("foo/sub", str(e.exception))
+
+    def test_reproject_cmd_checks_the_whole_manifest(self) -> None:
+        """Ensure nesting is checked beyond the projects given as args."""
+        p_foo = FakeProject("foo")
+        p_foo_bar = FakeProject("foo/bar")
+        p_foo.UseReprojectCmd = p_foo_bar.UseReprojectCmd = True
+        self.cmd.GetProjects.side_effect = lambda args, **kwargs: (
+            [p_foo_bar] if args else [p_foo, p_foo_bar]
+        )
+        with self.assertRaises(sync.SyncError):
+            self._ExecuteUntilSync(["foo/bar"])
+        self.assertEqual(self.cmd.GetProjects.call_count, 2)
+        _, kwargs = self.cmd.GetProjects.call_args
+        self.assertEqual(kwargs.get("missing_ok"), True)
+
+    def test_reproject_cmd_off_ignores_nested_projects(self) -> None:
+        """Ensure nesting is only checked with repo.reprojectcmd in use."""
+        projects = [FakeProject("foo"), FakeProject("foo/bar")]
+        for p in projects:
+            p.Exists = False
+        self.cmd.GetProjects.return_value = projects
+        phased, interleaved = self._ExecuteUntilSync([])
+        self.assertTrue(phased.called or interleaved.called)
+
+    def test_implicit_smart_sync_fallback(self) -> None:
+        """Ensure implicit smart sync silently falls back to ToT."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        mock.patch.object(self.cmd, "_UpdateAllManifestProjects").start()
+        self.opt.verbose = False
+        with mock.patch.object(
+            self.cmd,
+            "_SmartSyncSetup",
+            side_effect=sync.SmartSyncError("unreachable"),
+        ) as mock_setup:
+            with mock.patch.object(self.cmd, "_UpdateRepoProject"):
+                with mock.patch.object(
+                    self.cmd, "_ValidateOptionsWithManifest"
+                ):
+                    with mock.patch.object(self.cmd, "_SyncInterleaved"):
+                        with mock.patch.object(self.cmd, "_RunPostSyncHook"):
+                            with mock.patch.object(
+                                sync.logger, "warning"
+                            ) as mock_warn:
+                                self.cmd.Execute(self.opt, [])
+        mock_setup.assert_called_once()
+        self.assertTrue(mock_setup.call_args.kwargs.get("best_effort"))
+        self.assertFalse(self.opt.smart_sync)
+        self.assertFalse(mock_warn.called)
+
+    def test_implicit_smart_sync_fallback_verbose(self) -> None:
+        """Ensure the fallback reason is logged when --verbose is given."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        mock.patch.object(self.cmd, "_UpdateAllManifestProjects").start()
+        self.opt.verbose = True
+        with mock.patch.object(
+            self.cmd,
+            "_SmartSyncSetup",
+            side_effect=sync.SmartSyncError("unreachable"),
+        ):
+            with mock.patch.object(self.cmd, "_UpdateRepoProject"):
+                with mock.patch.object(
+                    self.cmd, "_ValidateOptionsWithManifest"
+                ):
+                    with mock.patch.object(self.cmd, "_SyncInterleaved"):
+                        with mock.patch.object(self.cmd, "_RunPostSyncHook"):
+                            with mock.patch.object(
+                                sync.logger, "warning"
+                            ) as mock_warn:
+                                self.cmd.Execute(self.opt, [])
+        self.assertFalse(self.opt.smart_sync)
+        self.assertTrue(mock_warn.called)
+
+    def test_explicit_smart_sync_error(self) -> None:
+        """Ensure explicit smart sync raises SmartSyncError on failure."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = True
+        self.opt.mp_update = False
+        with mock.patch.object(
+            self.cmd,
+            "_SmartSyncSetup",
+            side_effect=sync.SmartSyncError("unreachable"),
+        ) as mock_setup:
+            with self.assertRaises(sync.SmartSyncError):
+                self.cmd.Execute(self.opt, [])
+            mock_setup.assert_called_once()
+            self.assertFalse(mock_setup.call_args.kwargs.get("best_effort"))
+
+    def test_user_config_smart_sync_disabled(self) -> None:
+        """Ensure sync.smartsync=false skips the manifest's default."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        mock.patch.object(self.cmd, "_UpdateAllManifestProjects").start()
+        user_cfg = mock.MagicMock()
+        user_cfg.GetBoolean.return_value = False
+        with mock.patch.object(
+            sync.RepoConfig, "ForUser", return_value=user_cfg
+        ):
+            with mock.patch.object(self.cmd, "_SmartSyncSetup") as mock_setup:
+                with mock.patch.object(self.cmd, "_UpdateRepoProject"):
+                    with mock.patch.object(
+                        self.cmd, "_ValidateOptionsWithManifest"
+                    ):
+                        with mock.patch.object(self.cmd, "_SyncInterleaved"):
+                            with mock.patch.object(
+                                self.cmd, "_RunPostSyncHook"
+                            ):
+                                self.cmd.Execute(self.opt, [])
+        mock_setup.assert_not_called()
+        self.assertFalse(self.opt.smart_sync)
+
+    def test_user_config_smart_sync_enabled_error(self) -> None:
+        """Ensure sync.smartsync=true fails hard instead of falling back."""
+        self.manifest.default.sync_smartsync = False
+        self.opt.smart_sync = None
+        self.opt.mp_update = False
+        user_cfg = mock.MagicMock()
+        user_cfg.GetBoolean.return_value = True
+        with mock.patch.object(
+            sync.RepoConfig, "ForUser", return_value=user_cfg
+        ):
+            with mock.patch.object(
+                self.cmd,
+                "_SmartSyncSetup",
+                side_effect=sync.SmartSyncError("unreachable"),
+            ) as mock_setup:
+                with self.assertRaises(sync.SmartSyncError):
+                    self.cmd.Execute(self.opt, [])
+        mock_setup.assert_called_once()
+
+    def test_implicit_smart_sync_unparsable_manifest(self) -> None:
+        """Ensure an unparsable smart sync manifest falls back to ToT."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        mock.patch.object(self.cmd, "_UpdateAllManifestProjects").start()
+        self.opt.verbose = False
+        with mock.patch.object(
+            self.cmd,
+            "_SmartSyncSetup",
+            side_effect=ManifestParseError("mismatched tag"),
+        ):
+            with mock.patch.object(self.cmd, "_UpdateRepoProject"):
+                with mock.patch.object(
+                    self.cmd, "_ValidateOptionsWithManifest"
+                ):
+                    with mock.patch.object(self.cmd, "_SyncInterleaved"):
+                        with mock.patch.object(self.cmd, "_RunPostSyncHook"):
+                            self.cmd.Execute(self.opt, [])
+        self.assertFalse(self.opt.smart_sync)
+        # A half-applied override would pin the client to a broken manifest.
+        self.manifest.ClearOverride.assert_called_once_with()
+
+    def test_explicit_smart_sync_unparsable_manifest(self) -> None:
+        """Ensure explicit smart sync still reports the parse error."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = True
+        self.opt.mp_update = False
+        with mock.patch.object(
+            self.cmd,
+            "_SmartSyncSetup",
+            side_effect=ManifestParseError("mismatched tag"),
+        ):
+            with self.assertRaises(ManifestParseError):
+                self.cmd.Execute(self.opt, [])
+
+    def _ExecuteWithSmartSyncOverride(
+        self,
+        reload_error: Optional[Exception] = None,
+        setup_error: Optional[Exception] = None,
+    ) -> Tuple[str, mock.MagicMock, mock.MagicMock, mock.MagicMock]:
+        """Run Execute with an existing smart sync override on disk.
+
+        Returns:
+            The override path, and the _SmartSyncSetup, _ReloadManifest and
+            _UpdateAllManifestProjects mocks.
+        """
+        worktree = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, worktree)
+        self.manifest.manifestProject.worktree = worktree
+        # -l reloads the superproject manifest; keep that out of the way.
+        self.manifest.superproject = None
+        self.opt.verbose = False
+        override_path = os.path.join(worktree, "smart_sync_override.xml")
+        with open(override_path, "w") as f:
+            f.write("<manifest />")
+
+        with contextlib.ExitStack() as stack:
+            for name in (
+                "_UpdateRepoProject",
+                "_ValidateOptionsWithManifest",
+                "_SyncInterleaved",
+                "_RunPostSyncHook",
+            ):
+                stack.enter_context(mock.patch.object(self.cmd, name))
+            setup = stack.enter_context(
+                mock.patch.object(
+                    self.cmd, "_SmartSyncSetup", side_effect=setup_error
+                )
+            )
+            reload = stack.enter_context(
+                mock.patch.object(
+                    self.cmd, "_ReloadManifest", side_effect=reload_error
+                )
+            )
+            update_mps = stack.enter_context(
+                mock.patch.object(self.cmd, "_UpdateAllManifestProjects")
+            )
+            self.cmd.Execute(self.opt, [])
+        return override_path, setup, reload, update_mps
+
+    def test_smart_sync_override_reused_offline(self) -> None:
+        """Ensure -l reuses an existing smart sync manifest.
+
+        This applies whether the override came from the manifest's
+        sync-smartsync default or from an explicit -s, so that `sync -n`
+        followed by `sync -l` matches a single sync.
+        """
+        for sync_smartsync in (True, False):
+            for mp_update in (True, False):
+                with self.subTest(
+                    sync_smartsync=sync_smartsync, mp_update=mp_update
+                ):
+                    self.manifest.default.sync_smartsync = sync_smartsync
+                    self.opt.smart_sync = None
+                    self.opt.local_only = True
+                    self.opt.mp_update = mp_update
+                    path, setup, reload, update_mps = (
+                        self._ExecuteWithSmartSyncOverride()
+                    )
+                    setup.assert_not_called()
+                    reload.assert_called_once_with(
+                        "smart_sync_override.xml", self.manifest
+                    )
+                    self.assertTrue(os.path.isfile(path))
+                    if mp_update:
+                        self.assertEqual(
+                            update_mps.call_args[0][2],
+                            "smart_sync_override.xml",
+                        )
+
+    def test_no_manifest_update_keeps_default_smart_sync(self) -> None:
+        """Ensure --nmu still runs the manifest-driven default smart sync."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        self.opt.mp_update = False
+        _, setup, _, update_mps = self._ExecuteWithSmartSyncOverride()
+        setup.assert_called_once()
+        update_mps.assert_not_called()
+
+    def test_no_manifest_update_does_not_reuse_override(self) -> None:
+        """Ensure --nmu handles an existing override like a regular sync."""
+        cases = (
+            ("manifest without sync-smartsync", False, None),
+            ("failed default smart sync", True, sync.SmartSyncError("down")),
+        )
+        for name, sync_smartsync, setup_error in cases:
+            with self.subTest(name):
+                self.manifest.default.sync_smartsync = sync_smartsync
+                self.opt.smart_sync = None
+                self.opt.mp_update = False
+                path, _, reload, _ = self._ExecuteWithSmartSyncOverride(
+                    setup_error=setup_error
+                )
+                reload.assert_not_called()
+                self.assertFalse(os.path.isfile(path))
+
+    def test_smart_sync_override_removed_offline(self) -> None:
+        """Ensure -l --no-smart-sync still drops the override."""
+        for sync_smartsync in (True, False):
+            with self.subTest(sync_smartsync=sync_smartsync):
+                self.manifest.default.sync_smartsync = sync_smartsync
+                self.opt.smart_sync = False
+                self.opt.local_only = True
+                path, setup, reload, _ = self._ExecuteWithSmartSyncOverride()
+                setup.assert_not_called()
+                reload.assert_not_called()
+                self.assertFalse(os.path.isfile(path))
+
+    def test_smart_sync_override_unparsable_offline(self) -> None:
+        """Ensure an unloadable reused override falls back to ToT."""
+        self.manifest.default.sync_smartsync = True
+        self.opt.smart_sync = None
+        self.opt.local_only = True
+        path, _, _, update_mps = self._ExecuteWithSmartSyncOverride(
+            reload_error=ManifestParseError("mismatched tag")
+        )
+        self.manifest.ClearOverride.assert_called_once_with()
+        self.assertFalse(os.path.isfile(path))
+        self.assertIsNone(update_mps.call_args[0][2])
+
+
+class SyncUpdateRepoProject(unittest.TestCase):
+    """Tests for Sync._UpdateRepoProject."""
+
+    def setUp(self):
+        """Common setup."""
+        self.repodir = tempfile.mkdtemp(".repo")
+        self.manifest = manifest = mock.MagicMock(repodir=self.repodir)
+        # Create a repoProject with a mock Sync_NetworkHalf.
+        repoProject = mock.MagicMock(name="repo")
+        repoProject.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(True, None)
+        )
+        manifest.repoProject = repoProject
+        manifest.IsArchive = False
+        manifest.CloneFilter = None
+        manifest.PartialCloneExclude = None
+        manifest.CloneFilterForDepth = None
+
+        git_event_log = mock.MagicMock(ErrorEvent=mock.Mock(return_value=None))
+        self.cmd = sync.Sync(manifest=manifest, git_event_log=git_event_log)
+
+        opt, _ = self.cmd.OptionParser.parse_args([])
+        opt.local_only = False
+        opt.repo_verify = False
+        opt.verbose = False
+        opt.quiet = True
+        opt.force_sync = False
+        opt.clone_bundle = False
+        opt.tags = False
+        opt.optimized_fetch = False
+        opt.retry_fetches = 0
+        opt.prune = False
+        self.opt = opt
+        self.errors = []
+
+        mock.patch.object(sync.Sync, "_GetCurrentBranchOnly").start()
+
+    def tearDown(self):
+        shutil.rmtree(self.repodir)
+        mock.patch.stopall()
+
+    def test_fetches_when_stale(self):
+        """Test it fetches when the repo project is stale."""
+        self.manifest.repoProject.LastFetch = time.time() - (
+            sync._ONE_DAY_S + 1
+        )
+
+        with mock.patch.object(sync, "_PostRepoFetch") as mock_post_fetch:
+            self.cmd._UpdateRepoProject(self.opt, self.manifest, self.errors)
+            self.manifest.repoProject.Sync_NetworkHalf.assert_called_once()
+            mock_post_fetch.assert_called_once()
+            self.assertEqual(self.errors, [])
+
+    def test_skips_when_fresh(self):
+        """Test it skips fetch when repo project is fresh."""
+        self.manifest.repoProject.LastFetch = time.time()
+
+        with mock.patch.object(sync, "_PostRepoFetch") as mock_post_fetch:
+            self.cmd._UpdateRepoProject(self.opt, self.manifest, self.errors)
+            self.manifest.repoProject.Sync_NetworkHalf.assert_not_called()
+            mock_post_fetch.assert_not_called()
+
+    def test_skips_local_only(self):
+        """Test it does nothing with --local-only."""
+        self.opt.local_only = True
+        self.manifest.repoProject.LastFetch = time.time() - (
+            sync._ONE_DAY_S + 1
+        )
+
+        with mock.patch.object(sync, "_PostRepoFetch") as mock_post_fetch:
+            self.cmd._UpdateRepoProject(self.opt, self.manifest, self.errors)
+            self.manifest.repoProject.Sync_NetworkHalf.assert_not_called()
+            mock_post_fetch.assert_not_called()
+
+    def test_post_repo_fetch_skipped_on_env_var(self):
+        """Test _PostRepoFetch is skipped when REPO_SKIP_SELF_UPDATE is set."""
+        self.manifest.repoProject.LastFetch = time.time()
+
+        with mock.patch.dict(os.environ, {"REPO_SKIP_SELF_UPDATE": "1"}):
+            with mock.patch.object(sync, "_PostRepoFetch") as mock_post_fetch:
+                self.cmd._UpdateRepoProject(
+                    self.opt, self.manifest, self.errors
+                )
+                mock_post_fetch.assert_not_called()
+
+    def test_fetch_failure_is_handled(self):
+        """Test that a fetch failure is recorded and doesn't crash."""
+        self.manifest.repoProject.LastFetch = time.time() - (
+            sync._ONE_DAY_S + 1
+        )
+        fetch_error = GitError("Fetch failed")
+        self.manifest.repoProject.Sync_NetworkHalf.return_value = (
+            SyncNetworkHalfResult(False, fetch_error)
+        )
+
+        with mock.patch.object(sync, "_PostRepoFetch") as mock_post_fetch:
+            self.cmd._UpdateRepoProject(self.opt, self.manifest, self.errors)
+            self.manifest.repoProject.Sync_NetworkHalf.assert_called_once()
+            mock_post_fetch.assert_not_called()
+            self.assertEqual(self.errors, [fetch_error])
+
+
+class InterleavedSyncTest(unittest.TestCase):
+    """Tests for interleaved sync."""
+
+    def setUp(self):
+        """Set up a sync command with mocks."""
+        self.repodir = tempfile.mkdtemp(".repo")
+        self.manifest = mock.MagicMock(repodir=self.repodir)
+        self.manifest.repoProject.LastFetch = time.time()
+        self.manifest.repoProject.worktree = self.repodir
+        self.manifest.manifestProject.worktree = self.repodir
+        self.manifest.IsArchive = False
+        self.manifest.CloneBundle = False
+        self.manifest.default.sync_j = 1
+
+        self.outer_client = mock.MagicMock()
+        self.outer_client.manifest.IsArchive = False
+        self.cmd = sync.Sync(
+            manifest=self.manifest, outer_client=self.outer_client
+        )
+        self.cmd.outer_manifest = self.manifest
+
+        # Mock projects.
+        self.projA = FakeProject("projA", objdir="objA")
+        self.projB = FakeProject("projB", objdir="objB")
+        self.projA_sub = FakeProject(
+            "projA/sub", name="projA_sub", objdir="objA_sub"
+        )
+        self.projC = FakeProject("projC", objdir="objC")
+
+        # Mock methods that are not part of the core interleaved sync logic.
+        mock.patch.object(self.cmd, "_UpdateAllManifestProjects").start()
+        mock.patch.object(self.cmd, "_UpdateProjectsRevisionId").start()
+        mock.patch.object(self.cmd, "_ValidateOptionsWithManifest").start()
+        mock.patch.object(sync, "_PostRepoUpgrade").start()
+        mock.patch.object(sync, "_PostRepoFetch").start()
+
+        # Mock parallel context for worker tests.
+        self.parallel_context_patcher = mock.patch(
+            "subcmds.sync.Sync.get_parallel_context"
+        )
+        self.mock_get_parallel_context = self.parallel_context_patcher.start()
+        self.sync_dict = {}
+        self.mock_context = {
+            "projects": [],
+            "sync_dict": self.sync_dict,
+        }
+        self.mock_get_parallel_context.return_value = self.mock_context
+
+        # Mock _GetCurrentBranchOnly for worker tests.
+        mock.patch.object(sync.Sync, "_GetCurrentBranchOnly").start()
+
+        self.cmd._fetch_times = mock.Mock()
+        self.cmd._local_sync_state = mock.Mock()
+
+    def tearDown(self):
+        """Clean up resources."""
+        shutil.rmtree(self.repodir)
+        mock.patch.stopall()
+
+    def test_interleaved_fail_fast(self):
+        """Test that --fail-fast is respected in interleaved mode."""
+        opt, args = self.cmd.OptionParser.parse_args(
+            ["--interleaved", "--fail-fast", "-j2"]
+        )
+        opt.quiet = True
+
+        # With projA/sub, _SafeCheckoutOrder creates two batches:
+        # 1. [projA, projB]
+        # 2. [projA/sub]
+        # We want to fail on the first batch and ensure the second isn't run.
+        all_projects = [self.projA, self.projB, self.projA_sub]
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=all_projects
+        ).start()
+
+        # Mock ExecuteInParallel to simulate a failed run on the first batch of
+        # projects.
+        execute_mock = mock.patch.object(
+            self.cmd, "ExecuteInParallel", return_value=False
+        ).start()
+
+        with self.assertRaises(sync.SyncFailFastError):
+            self.cmd._SyncInterleaved(
+                opt,
+                args,
+                [],
+                self.manifest,
+                self.manifest.manifestProject,
+                all_projects,
+                {},
+            )
+
+        execute_mock.assert_called_once()
+
+    def test_interleaved_refreshes_submodule_revision(self) -> None:
+        """Test submodules are synced at the revision of the fetched parent."""
+        opt, args = self.cmd.OptionParser.parse_args(["--interleaved", "-j4"])
+        opt.quiet = True
+
+        submodule = FakeProject(
+            "projA/sub",
+            name="projA_sub",
+            objdir="objA_sub",
+            parent=self.projA,
+            is_derived=True,
+            revisionId="stale",
+            gitlink_path="sub",
+        )
+        all_projects = [self.projA, submodule]
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=all_projects
+        ).start()
+
+        self.projA.GetSubmoduleRevisions = mock.Mock(
+            return_value={"sub": "fetched"}
+        )
+
+        synced = []
+
+        def execute_side_effect(
+            jobs: int,
+            target: object,
+            work_items: List[List[int]],
+            **kwargs: object,
+        ) -> bool:
+            synced_relpaths_set = kwargs["callback"].args[0]
+            projects_in_pass = self.cmd.get_parallel_context()["projects"]
+            for item in work_items:
+                for project_idx in item:
+                    project = projects_in_pass[project_idx]
+                    synced.append((project.relpath, project.revisionId))
+                    synced_relpaths_set.add(project.relpath)
+            return True
+
+        mock.patch.object(
+            self.cmd, "ExecuteInParallel", side_effect=execute_side_effect
+        ).start()
+
+        self.cmd._SyncInterleaved(
+            opt,
+            args,
+            [],
+            self.manifest,
+            self.manifest.manifestProject,
+            all_projects,
+            {},
+        )
+
+        self.assertIn(("projA/sub", "fetched"), synced)
+
+    def test_interleaved_skips_removed_submodule(self) -> None:
+        """Test submodules dropped by their parent are not checked out."""
+        opt, args = self.cmd.OptionParser.parse_args(["--interleaved", "-j4"])
+        opt.quiet = True
+
+        submodule = FakeProject(
+            "projA/sub",
+            name="projA_sub",
+            objdir="objA_sub",
+            parent=self.projA,
+            is_derived=True,
+            revisionId="stale",
+            gitlink_path="sub",
+        )
+        # The parent no longer holds a gitlink for the submodule.
+        self.projA.GetSubmoduleRevisions = mock.Mock(return_value={})
+        # The reloaded manifest no longer derives the removed submodule.
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=[self.projA]
+        ).start()
+
+        synced = []
+
+        def execute_side_effect(
+            jobs: int,
+            target: object,
+            work_items: List[List[int]],
+            **kwargs: object,
+        ) -> bool:
+            synced_relpaths_set = kwargs["callback"].args[0]
+            projects_in_pass = self.cmd.get_parallel_context()["projects"]
+            for item in work_items:
+                for project_idx in item:
+                    project = projects_in_pass[project_idx]
+                    synced.append(project.relpath)
+                    synced_relpaths_set.add(project.relpath)
+            return True
+
+        mock.patch.object(
+            self.cmd, "ExecuteInParallel", side_effect=execute_side_effect
+        ).start()
+
+        self.cmd._SyncInterleaved(
+            opt,
+            args,
+            [],
+            self.manifest,
+            self.manifest.manifestProject,
+            [self.projA, submodule],
+            {},
+        )
+
+        self.assertEqual(synced, ["projA"])
+
+    def _make_syncable(self, project: FakeProject) -> FakeProject:
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(error=None, remote_fetched=True)
+        )
+        project.Sync_LocalHalf = mock.Mock()
+        return project
+
+    def _run_interleaved(
+        self,
+        opt: optparse.Values,
+        initial_projects: List[FakeProject],
+        reloaded_projects: List[FakeProject],
+    ) -> None:
+        """Run _SyncInterleaved with the real workers and callback.
+
+        |initial_projects| make up the first pass, |reloaded_projects| every
+        later one, the way reloading the manifest between passes does.
+        """
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=reloaded_projects
+        ).start()
+        mock.patch.object(self.cmd, "event_log").start()
+
+        def execute_side_effect(
+            jobs: int,
+            target: object,
+            work_items: List[List[int]],
+            **kwargs: object,
+        ) -> bool:
+            results = [target(item) for item in work_items]
+            return kwargs["callback"](None, kwargs["output"], results)
+
+        mock.patch.object(
+            self.cmd, "ExecuteInParallel", side_effect=execute_side_effect
+        ).start()
+
+        with mock.patch("subcmds.sync.SyncBuffer") as mock_sync_buffer:
+            mock_sync_buffer.return_value.Finish.return_value = True
+            mock_sync_buffer.return_value.errors = []
+            self.cmd._SyncInterleaved(
+                opt,
+                [],
+                [],
+                self.manifest,
+                self.manifest.manifestProject,
+                initial_projects,
+                {},
+            )
+
+    def test_interleaved_syncs_same_path_projects_of_every_manifest(
+        self,
+    ) -> None:
+        """Test a project is not skipped because another shares its path."""
+        opt = self._get_opts(["--interleaved", "-j4"])
+        outer = self._make_syncable(
+            FakeProject("foo", name="outer", objdir="a")
+        )
+        sub = self._make_syncable(
+            FakeProject("foo", name="sub", objdir="b", path_prefix="sub")
+        )
+
+        # |sub| is only discovered once the manifest is reloaded after the
+        # first pass has synced |outer|.
+        self._run_interleaved(opt, [outer], [outer, sub])
+
+        outer.Sync_LocalHalf.assert_called_once()
+        sub.Sync_LocalHalf.assert_called_once()
+
+    def test_interleaved_reports_failures_by_a_unique_path(self) -> None:
+        """Test failing projects are listed by a path that is theirs alone."""
+        opt = self._get_opts(["--interleaved", "-j4"])
+        outer = self._make_syncable(
+            FakeProject("foo", name="outer", objdir="a")
+        )
+        sub = self._make_syncable(
+            FakeProject("foo", name="sub", objdir="b", path_prefix="sub")
+        )
+        sub.Sync_LocalHalf.side_effect = GitError("checkout failed")
+        self.cmd.git_event_log = mock.MagicMock()
+
+        with self.assertRaises(sync.SyncError):
+            self._run_interleaved(opt, [outer, sub], [outer, sub])
+
+        self.assertEqual(
+            self.cmd._interleaved_err_checkout_results, ["sub/foo"]
+        )
+
+    def test_interleaved_shared_objdir_serial(self):
+        """Test that projects with shared objdir are processed serially."""
+        opt, args = self.cmd.OptionParser.parse_args(["--interleaved", "-j4"])
+        opt.quiet = True
+
+        # Setup projects with a shared objdir.
+        self.projA.objdir = "common_objdir"
+        self.projC.objdir = "common_objdir"
+
+        all_projects = [self.projA, self.projB, self.projC]
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=all_projects
+        ).start()
+
+        def execute_side_effect(jobs, target, work_items, **kwargs):
+            # The callback is a partial object. The first arg is the set we
+            # need to update to avoid the stall detection.
+            synced_relpaths_set = kwargs["callback"].args[0]
+            projects_in_pass = self.cmd.get_parallel_context()["projects"]
+            for item in work_items:
+                for project_idx in item:
+                    synced_relpaths_set.add(
+                        projects_in_pass[project_idx].relpath
+                    )
+            return True
+
+        execute_mock = mock.patch.object(
+            self.cmd, "ExecuteInParallel", side_effect=execute_side_effect
+        ).start()
+
+        self.cmd._SyncInterleaved(
+            opt,
+            args,
+            [],
+            self.manifest,
+            self.manifest.manifestProject,
+            all_projects,
+            {},
+        )
+
+        execute_mock.assert_called_once()
+        jobs_arg, _, work_items = execute_mock.call_args.args
+        self.assertEqual(jobs_arg, 2)
+        work_items_sets = {frozenset(item) for item in work_items}
+        expected_sets = {frozenset([0, 2]), frozenset([1])}
+        self.assertEqual(work_items_sets, expected_sets)
+
+    def _get_opts(self, args=None):
+        """Helper to get default options for worker tests."""
+        if args is None:
+            args = ["--interleaved"]
+        opt, _ = self.cmd.OptionParser.parse_args(args)
+        # Set defaults for options used by the worker.
+        opt.quiet = True
+        opt.verbose = False
+        opt.force_sync = False
+        opt.clone_bundle = False
+        opt.tags = False
+        opt.optimized_fetch = False
+        opt.retry_fetches = 0
+        opt.prune = False
+        opt.detach_head = False
+        opt.force_checkout = False
+        opt.rebase = False
+        return opt
+
+    def test_worker_successful_sync(self):
+        """Test _SyncProjectList with a successful fetch and checkout."""
+        opt = self._get_opts()
+        project = self.projA
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(error=None, remote_fetched=True)
+        )
+        project.Sync_LocalHalf = mock.Mock()
+        project.manifest.manifestProject.config = mock.MagicMock()
+        self.mock_context["projects"] = [project]
+
+        with mock.patch("subcmds.sync.SyncBuffer") as mock_sync_buffer:
+            mock_sync_buf_instance = mock.MagicMock()
+            mock_sync_buf_instance.Finish.return_value = True
+            mock_sync_buf_instance.errors = []
+            mock_sync_buffer.return_value = mock_sync_buf_instance
+
+            result_obj = self.cmd._SyncProjectList(opt, [0])
+
+            self.assertEqual(len(result_obj.results), 1)
+            result = result_obj.results[0]
+            self.assertTrue(result.fetch_success)
+            self.assertTrue(result.checkout_success)
+            self.assertEqual(result.fetch_errors, [])
+            self.assertEqual(result.checkout_errors, [])
+            project.Sync_NetworkHalf.assert_called_once()
+            project.Sync_LocalHalf.assert_called_once()
+
+    def test_worker_reports_a_path_unique_across_manifests(self) -> None:
+        """Test _SyncResult.relpath tells apart same-path projects."""
+        project = FakeProject("foo", objdir="objA", path_prefix="sub")
+        self._make_syncable(project)
+        self.mock_context["projects"] = [project]
+
+        for this_manifest_only, expected in ((False, "sub/foo"), (True, "foo")):
+            with self.subTest(this_manifest_only=this_manifest_only):
+                opt = self._get_opts()
+                opt.this_manifest_only = this_manifest_only
+                with mock.patch("subcmds.sync.SyncBuffer") as mock_sync_buffer:
+                    mock_sync_buffer.return_value.Finish.return_value = True
+                    mock_sync_buffer.return_value.errors = []
+                    result_obj = self.cmd._SyncProjectList(opt, [0])
+
+                self.assertEqual(result_obj.results[0].relpath, expected)
+
+    def test_worker_fetch_fails(self):
+        """Test _SyncProjectList with a failed fetch."""
+        opt = self._get_opts()
+        project = self.projA
+        fetch_error = GitError("Fetch failed")
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(
+                error=fetch_error, remote_fetched=False
+            )
+        )
+        project.Sync_LocalHalf = mock.Mock()
+        self.mock_context["projects"] = [project]
+
+        result_obj = self.cmd._SyncProjectList(opt, [0])
+        result = result_obj.results[0]
+
+        self.assertFalse(result.fetch_success)
+        self.assertFalse(result.checkout_success)
+        self.assertEqual(result.fetch_errors, [fetch_error])
+        self.assertEqual(result.checkout_errors, [])
+        project.Sync_NetworkHalf.assert_called_once()
+        project.Sync_LocalHalf.assert_not_called()
+
+    def test_worker_no_worktree(self):
+        """Test interleaved sync does not checkout with no worktree."""
+        opt = self._get_opts()
+        project = self.projA
+        project.worktree = None
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(error=None, remote_fetched=True)
+        )
+        project.Sync_LocalHalf = mock.Mock()
+        self.mock_context["projects"] = [project]
+
+        result_obj = self.cmd._SyncProjectList(opt, [0])
+        result = result_obj.results[0]
+
+        self.assertTrue(result.fetch_success)
+        self.assertTrue(result.checkout_success)
+        project.Sync_NetworkHalf.assert_called_once()
+        project.Sync_LocalHalf.assert_not_called()
+
+    def test_worker_fetch_fails_exception(self):
+        """Test _SyncProjectList with an exception during fetch."""
+        opt = self._get_opts()
+        project = self.projA
+        fetch_error = GitError("Fetch failed")
+        project.Sync_NetworkHalf = mock.Mock(side_effect=fetch_error)
+        project.Sync_LocalHalf = mock.Mock()
+        self.mock_context["projects"] = [project]
+
+        result_obj = self.cmd._SyncProjectList(opt, [0])
+        result = result_obj.results[0]
+
+        self.assertFalse(result.fetch_success)
+        self.assertFalse(result.checkout_success)
+        self.assertEqual(result.fetch_errors, [fetch_error])
+        project.Sync_NetworkHalf.assert_called_once()
+        project.Sync_LocalHalf.assert_not_called()
+
+    def test_worker_checkout_fails(self):
+        """Test _SyncProjectList with an exception during checkout."""
+        opt = self._get_opts()
+        project = self.projA
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(error=None, remote_fetched=True)
+        )
+        checkout_error = GitError("Checkout failed")
+        project.Sync_LocalHalf = mock.Mock(side_effect=checkout_error)
+        project.manifest.manifestProject.config = mock.MagicMock()
+        self.mock_context["projects"] = [project]
+
+        with mock.patch("subcmds.sync.SyncBuffer"):
+            result_obj = self.cmd._SyncProjectList(opt, [0])
+            result = result_obj.results[0]
+
+            self.assertTrue(result.fetch_success)
+            self.assertFalse(result.checkout_success)
+            self.assertEqual(result.fetch_errors, [])
+            self.assertEqual(result.checkout_errors, [checkout_error])
+            project.Sync_NetworkHalf.assert_called_once()
+            project.Sync_LocalHalf.assert_called_once()
+
+    def test_worker_local_only(self):
+        """Test _SyncProjectList with --local-only."""
+        opt = self._get_opts(["--interleaved", "--local-only"])
+        project = self.projA
+        project.Sync_NetworkHalf = mock.Mock()
+        project.Sync_LocalHalf = mock.Mock()
+        project.manifest.manifestProject.config = mock.MagicMock()
+        self.mock_context["projects"] = [project]
+
+        with mock.patch("subcmds.sync.SyncBuffer") as mock_sync_buffer:
+            mock_sync_buf_instance = mock.MagicMock()
+            mock_sync_buf_instance.Finish.return_value = True
+            mock_sync_buf_instance.errors = []
+            mock_sync_buffer.return_value = mock_sync_buf_instance
+
+            result_obj = self.cmd._SyncProjectList(opt, [0])
+            result = result_obj.results[0]
+
+            self.assertTrue(result.fetch_success)
+            self.assertTrue(result.checkout_success)
+            project.Sync_NetworkHalf.assert_not_called()
+            project.Sync_LocalHalf.assert_called_once()
+
+    def test_worker_network_only(self):
+        """Test _SyncProjectList with --network-only."""
+        opt = self._get_opts(["--interleaved", "--network-only"])
+        project = self.projA
+        project.Sync_NetworkHalf = mock.Mock(
+            return_value=SyncNetworkHalfResult(error=None, remote_fetched=True)
+        )
+        project.Sync_LocalHalf = mock.Mock()
+        self.mock_context["projects"] = [project]
+
+        result_obj = self.cmd._SyncProjectList(opt, [0])
+        result = result_obj.results[0]
+
+        self.assertTrue(result.fetch_success)
+        self.assertTrue(result.checkout_success)
+        project.Sync_NetworkHalf.assert_called_once()
+        project.Sync_LocalHalf.assert_not_called()
+
+
+class UpdateCopyLinkfileListTest(unittest.TestCase):
+    """Tests for Sync.UpdateCopyLinkfileList."""
+
+    def setUp(self):
+        self.tempdirobj = tempfile.TemporaryDirectory(prefix="repo_tests")
+        self.topdir = self.tempdirobj.name
+        self.repodir = os.path.join(self.topdir, ".repo")
+        os.makedirs(self.repodir)
+
+        manifest = mock.MagicMock()
+        manifest.subdir = self.repodir
+        self.manifest = manifest
+
+        git_event_log = mock.MagicMock(ErrorEvent=mock.Mock(return_value=None))
+        self.cmd = sync.Sync(
+            manifest=manifest,
+            outer_client=mock.MagicMock(),
+            git_event_log=git_event_log,
+        )
+        self.cmd.client = mock.MagicMock(topdir=self.topdir)
+
+    def tearDown(self):
+        self.tempdirobj.cleanup()
+
+    def _write_copylinkfile_json(self, data: dict) -> None:
+        path = os.path.join(self.repodir, "copy-link-files.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _setup_projects(self, linkfile_dests: list) -> None:
+        project = mock.MagicMock()
+        project.linkfiles = [mock.MagicMock(dest=d) for d in linkfile_dests]
+        project.copyfiles = []
+        mock.patch.object(
+            self.cmd, "GetProjects", return_value=[project]
+        ).start()
+
+    def test_removes_old_symlink_dest(self):
+        """Old linkfile dests that are symlinks should be removed."""
+        old_dest = os.path.join(self.topdir, "old-link")
+        os.symlink("target", old_dest)
+
+        self._write_copylinkfile_json(
+            {"linkfile": ["old-link"], "copyfile": []}
+        )
+        self._setup_projects([])
+
+        self.cmd.UpdateCopyLinkfileList(self.manifest)
+        self.assertFalse(os.path.lexists(old_dest))
+
+    def test_does_not_delete_through_new_symlink(self):
+        """Old dests that resolve through a new symlink must not delete files.
+
+        When the manifest changes from individual linkfiles inside a directory
+        to a single directory linkfile, and _CopyAndLinkFiles has already
+        created the symlink (interleaved mode), cleanup must not follow the
+        symlink and delete real project files.
+        """
+        project_dir = os.path.join(self.topdir, "vendor", "tools", "llms")
+        os.makedirs(os.path.join(project_dir, "dot-llms", "rules"))
+        os.makedirs(os.path.join(project_dir, "dot-llms", "skills"))
+        with open(
+            os.path.join(project_dir, "dot-llms", "rules", "basics.md"), "w"
+        ) as f:
+            f.write("# basics")
+        with open(
+            os.path.join(project_dir, "dot-llms", "skills", "repo.md"), "w"
+        ) as f:
+            f.write("# repo")
+
+        # Simulate interleaved mode: .llms -> vendor/tools/llms/dot-llms.
+        llms_link = os.path.join(self.topdir, ".llms")
+        os.symlink("vendor/tools/llms/dot-llms", llms_link)
+
+        self._write_copylinkfile_json(
+            {"linkfile": [".llms/rules", ".llms/skills"], "copyfile": []}
+        )
+        self._setup_projects([".llms"])
+
+        self.cmd.UpdateCopyLinkfileList(self.manifest)
+
+        # Real project files must still exist.
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(project_dir, "dot-llms", "rules", "basics.md")
+            )
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(project_dir, "dot-llms", "skills", "repo.md")
+            ),
+        )
+        self.assertTrue(os.path.islink(llms_link))
+
+    def test_cleans_up_empty_parent_dirs(self):
+        """After removing old dests, empty parent directories are removed."""
+        llms_dir = os.path.join(self.topdir, ".llms")
+        os.makedirs(llms_dir)
+        os.symlink(
+            "../vendor/tools/llms/rules", os.path.join(llms_dir, "rules")
+        )
+        os.symlink(
+            "../vendor/tools/llms/skills",
+            os.path.join(llms_dir, "skills"),
+        )
+
+        self._write_copylinkfile_json(
+            {"linkfile": [".llms/rules", ".llms/skills"], "copyfile": []}
+        )
+        self._setup_projects([".llms"])
+
+        self.cmd.UpdateCopyLinkfileList(self.manifest)
+
+        self.assertFalse(os.path.lexists(os.path.join(llms_dir, "rules")))
+        self.assertFalse(os.path.lexists(os.path.join(llms_dir, "skills")))
+        # Parent directory should be removed since it's now empty.
+        self.assertFalse(os.path.exists(llms_dir))
+
+    def test_preserves_nonempty_parent_dirs(self):
+        """Non-empty parent directories are preserved after old dest removal."""
+        llms_dir = os.path.join(self.topdir, ".llms")
+        os.makedirs(llms_dir)
+        os.symlink(
+            "../vendor/tools/llms/rules", os.path.join(llms_dir, "rules")
+        )
+        with open(os.path.join(llms_dir, "my-notes.txt"), "w") as f:
+            f.write("user content")
+
+        self._write_copylinkfile_json(
+            {"linkfile": [".llms/rules"], "copyfile": []}
+        )
+        self._setup_projects([".llms"])
+
+        self.cmd.UpdateCopyLinkfileList(self.manifest)
+
+        self.assertFalse(os.path.lexists(os.path.join(llms_dir, "rules")))
+        self.assertTrue(os.path.exists(os.path.join(llms_dir, "my-notes.txt")))
+        self.assertTrue(os.path.isdir(llms_dir))
+
+
+class SyncToSuperprojectRevTests(unittest.TestCase):
+    """Tests for Sync._SyncToSuperprojectRev."""
+
+    def setUp(self):
+        self.repodir = tempfile.mkdtemp(".repo")
+        self.manifest = mock.MagicMock(repodir=self.repodir)
+        self.manifest.superproject = mock.MagicMock()
+        self.manifest.path_prefix = ""
+
+        self.mp = mock.MagicMock()
+        self.cmd = sync.Sync(manifest=self.manifest)
+        self.cmd.outer_manifest = self.manifest
+
+        self.opt = mock.Mock()
+        self.opt.verbose = False
+        self.opt.superproject_revision = "deadbeef"
+        self.opt.mp_update = True
+
+        self.errors = []
+
+    def tearDown(self):
+        shutil.rmtree(self.repodir)
+
+    @mock.patch("subcmds.sync.GitCommand")
+    def test_successful_sync(self, mock_git_command):
+        """Test successful sync to superproject rev."""
+        mock_superproject = self.manifest.superproject
+        mock_superproject.Sync.return_value = mock.Mock(success=True)
+
+        mock_git = mock.Mock()
+        mock_git.Wait.return_value = 0
+        mock_git.stdout = "proj branch manifest_commit_hash\n"
+        mock_git_command.return_value = mock_git
+
+        with mock.patch.object(
+            self.cmd, "_UpdateManifestProject"
+        ) as mock_update:
+            self.cmd._SyncToSuperprojectRev(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+
+            mock_superproject.SetRevisionId.assert_called_with("deadbeef")
+            mock_superproject.Sync.assert_called_once()
+            mock_git_command.assert_called_once()
+            self.mp.SetRevision.assert_called_with("manifest_commit_hash")
+            mock_update.assert_called_once()
+            self.assertEqual(self.errors, [])
+
+    @mock.patch("subcmds.sync.GitCommand")
+    def test_parse_error(self, mock_git_command):
+        """Test error when .supermanifest cannot be parsed."""
+        mock_superproject = self.manifest.superproject
+        mock_superproject.Sync.return_value = mock.Mock(success=True)
+
+        mock_git = mock.Mock()
+        mock_git.Wait.return_value = 0
+        # Invalid format (not 3 parts)
+        mock_git.stdout = "invalid_content\n"
+        mock_git_command.return_value = mock_git
+
+        with self.assertRaises(sync.SyncError) as e:
+            self.cmd._SyncToSuperprojectRev(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+        self.assertIn("could not parse .supermanifest", str(e.exception))
+
+    @mock.patch("subcmds.sync.GitCommand")
+    def test_read_error(self, mock_git_command):
+        """Test error when reading .supermanifest fails."""
+        mock_superproject = self.manifest.superproject
+        mock_superproject.Sync.return_value = mock.Mock(success=True)
+
+        mock_git = mock.Mock()
+        mock_git.Wait.return_value = 1
+        mock_git.stderr = "git error"
+        mock_git_command.return_value = mock_git
+
+        with self.assertRaises(sync.SyncError) as e:
+            self.cmd._SyncToSuperprojectRev(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+        self.assertIn("failed to read .supermanifest", str(e.exception))
+
+    def test_no_superproject(self):
+        """Test error when superproject is not defined."""
+        self.manifest.superproject = None
+
+        with self.assertRaises(sync.SyncError) as e:
+            self.cmd._SyncToSuperprojectRev(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+        self.assertIn("superproject not defined", str(e.exception))
+
+    @mock.patch("subcmds.sync.GitCommand")
+    def test_sync_failure(self, mock_git_command):
+        """Test error when superproject sync fails."""
+        mock_superproject = self.manifest.superproject
+        mock_superproject.Sync.return_value = mock.Mock(success=False)
+
+        with self.assertRaises(sync.SyncError) as e:
+            self.cmd._SyncToSuperprojectRev(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+        self.assertIn("failed to sync superproject", str(e.exception))
+
+
+class UpdateAllManifestProjectsTests(unittest.TestCase):
+    """Tests for Sync._UpdateAllManifestProjects."""
+
+    def setUp(self):
+        self.repodir = tempfile.mkdtemp(".repo")
+        self.manifest = mock.MagicMock(repodir=self.repodir)
+        self.manifest.superproject = mock.MagicMock()
+        self.manifest.path_prefix = ""
+        self.manifest.standalone_manifest_url = None
+        self.manifest.submanifests = {}
+
+        self.mp = mock.MagicMock()
+        self.mp.manifest = self.manifest
+        self.mp.standalone_manifest_url = None
+        self.cmd = sync.Sync(manifest=self.manifest)
+        self.cmd.outer_manifest = self.manifest
+
+        self.opt = mock.Mock()
+        self.opt.verbose = False
+        self.opt.superproject_revision = None
+        self.opt.mp_update = True
+
+        self.errors = []
+
+    def tearDown(self):
+        shutil.rmtree(self.repodir)
+
+    def test_superproject_revision_outer_manifest(self):
+        """Test that _SyncToSuperprojectRev is called for outer manifest."""
+        self.opt.superproject_revision = "deadbeef"
+
+        with mock.patch.object(
+            self.cmd, "_SyncToSuperprojectRev"
+        ) as mock_sync_to_rev:
+            self.cmd._UpdateAllManifestProjects(
+                self.opt, self.mp, "name", self.errors
+            )
+            mock_sync_to_rev.assert_called_once_with(
+                self.opt, self.manifest, self.mp, "name", self.errors
+            )
+
+    def test_superproject_revision_submanifest(self):
+        """Test that _SyncToSuperprojectRev is NOT called for submanifest."""
+        self.opt.superproject_revision = "deadbeef"
+        submanifest = mock.MagicMock()
+        submanifest.path_prefix = "sub/"
+        submanifest.standalone_manifest_url = None
+        self.mp.manifest = submanifest
+
+        with mock.patch.object(
+            self.cmd, "_SyncToSuperprojectRev"
+        ) as mock_sync_to_rev:
+            with mock.patch.object(
+                self.cmd, "_UpdateManifestProject"
+            ) as mock_update_manifest:
+                self.cmd._UpdateAllManifestProjects(
+                    self.opt, self.mp, "name", self.errors
+                )
+                mock_sync_to_rev.assert_not_called()
+                mock_update_manifest.assert_called_once()
+
+
+class TestSmartSyncSetupRemoteHelper(unittest.TestCase):
+    """Tests for _SmartSyncSetup with remote helpers."""
+
+    def setUp(self):
+        self.cmd = sync.Sync()
+        self.opt = mock.MagicMock()
+        self.opt.quiet = False
+        self.opt.smart_sync = True
+        self.manifest = mock.MagicMock()
+        self.smart_sync_manifest_path = "/fake/path/to/manifest.xml"
+
+    @mock.patch("shutil.which")
+    @mock.patch("subprocess.Popen")
+    @mock.patch("xmlrpc.client.Server")
+    @mock.patch("subcmds.sync.PersistentTransport")
+    def test_smart_sync_setup_with_helper(
+        self, mock_transport_class, mock_server_class, mock_popen, mock_which
+    ):
+        """Test _SmartSyncSetup when a helper is present and succeeds."""
+        import subprocess
+
+        self.manifest.manifest_server = (
+            "persistent-https://android-smartsync.corp.google.com/"
+            "manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = "/fake/bin/repo-remote-sso"
+
+        # Mock subprocess to return a JSON with status ok and proxy address
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (
+            '{"status":"ok","message":"http://127.0.0.1:999"}\n',
+            "",
+        )
+        mock_process.returncode = 0
+        mock_popen.return_value = mock_process
+
+        # Mock XML-RPC server call
+        mock_server = mock.MagicMock()
+        mock_server.GetApprovedManifestV2.return_value = {
+            "success": True,
+            "manifest_xml": "<manifest></manifest>",
+        }
+        mock_server_class.return_value = mock_server
+
+        # Mock manifest project branch
+        self.cmd._GetBranch = mock.MagicMock(return_value="main")
+        self.cmd._ReloadManifest = mock.MagicMock()
+
+        # Mock open to avoid writing to disk
+        with mock.patch("builtins.open", mock.mock_open()):
+            manifest_name = self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        # Assertions
+        mock_which.assert_called_once_with("repo-remote-sso")
+        mock_popen.assert_called_once_with(
+            ["repo-remote-sso", self.manifest.manifest_server],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Verify transport was created with the proxy returned by helper (with
+        # http:// prepended)
+        mock_transport_class.assert_called_once_with(
+            self.manifest.manifest_server, proxy="http://127.0.0.1:999"
+        )
+
+        # Verify Server was created with the same URL, with persistent- stripped
+        mock_server_class.assert_called_once_with(
+            "https://android-smartsync.corp.google.com/manifestserver",
+            transport=mock_transport_class.return_value,
+        )
+
+        self.assertEqual(manifest_name, "manifest.xml")
+
+    @mock.patch("xmlrpc.client.Server")
+    def test_smart_sync_setup_unparsable_manifest(
+        self, mock_server_class: mock.MagicMock
+    ) -> None:
+        """Test _SmartSyncSetup when the server returns a bad manifest.
+
+        The parse error is left alone so that an explicit smart sync keeps
+        reporting it as-is; recovering from it is up to the caller.
+        """
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = None
+
+        mock_server = mock.MagicMock()
+        mock_server.GetApprovedManifestV2.return_value = {
+            "success": True,
+            "manifest_xml": "<manifest>",
+        }
+        mock_server_class.return_value = mock_server
+
+        self.cmd._GetBranch = mock.MagicMock(return_value="main")
+        self.cmd._ReloadManifest = mock.MagicMock(
+            side_effect=ManifestParseError("mismatched tag")
+        )
+
+        with mock.patch("builtins.open", mock.mock_open()):
+            with self.assertRaises(ManifestParseError):
+                self.cmd._SmartSyncSetup(
+                    self.opt, self.smart_sync_manifest_path, self.manifest
+                )
+
+    @mock.patch("shutil.which")
+    @mock.patch("subprocess.Popen")
+    def test_smart_sync_setup_helper_error(self, mock_popen, mock_which):
+        """Test _SmartSyncSetup when helper returns an error status."""
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = "/fake/bin/repo-remote-sso"
+
+        # Mock subprocess to return a JSON with status error
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (
+            '{"status":"error","message":"uplink-helper failed"}\n',
+            "",
+        )
+        mock_process.returncode = 0
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(sync.SmartSyncError) as context:
+            self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        self.assertIn(
+            "helper repo-remote-sso returned error: uplink-helper failed",
+            str(context.exception),
+        )
+
+    @mock.patch("shutil.which")
+    def test_smart_sync_setup_missing_declared_helper(self, mock_which):
+        """Test _SmartSyncSetup when helper declared in manifest is missing."""
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = None
+
+        with self.assertRaises(sync.SmartSyncError) as context:
+            self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        self.assertIn(
+            "helper binary 'repo-remote-sso' declared in manifest was not "
+            "found",
+            str(context.exception),
+        )
+
+    @mock.patch("shutil.which")
+    @mock.patch("subprocess.Popen")
+    def test_smart_sync_setup_helper_exit_code_error(
+        self, mock_popen, mock_which
+    ):
+        """Test _SmartSyncSetup when helper exits with non-zero and stderr."""
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = "/fake/bin/repo-remote-sso"
+
+        # Mock subprocess: exit code 1, stderr, and no JSON on stdout
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (
+            "",
+            "internal binary error occurred\n",
+        )
+        mock_process.returncode = 1
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(sync.SmartSyncError) as context:
+            self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        self.assertIn(
+            "helper repo-remote-sso exited with exit code 1. "
+            "Stderr: internal binary error occurred",
+            str(context.exception),
+        )
+
+    @mock.patch("shutil.which")
+    @mock.patch("subprocess.Popen")
+    def test_smart_sync_setup_helper_json_decode_error_with_stderr(
+        self, mock_popen, mock_which
+    ):
+        """Test _SmartSyncSetup when helper returns invalid JSON and stderr."""
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = "/fake/bin/repo-remote-sso"
+
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (
+            "not a json",
+            "some warning messages\n",
+        )
+        mock_process.returncode = 0
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(sync.SmartSyncError) as context:
+            self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        self.assertIn(
+            "failed to parse JSON from helper repo-remote-sso",
+            str(context.exception),
+        )
+        self.assertIn(
+            "Stderr was: some warning messages",
+            str(context.exception),
+        )
+
+    @mock.patch("shutil.which")
+    @mock.patch("subprocess.Popen")
+    def test_smart_sync_setup_helper_error_with_stderr(
+        self, mock_popen, mock_which
+    ):
+        """Test _SmartSyncSetup when helper returns error status and stderr."""
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = "repo-remote-sso"
+        mock_which.return_value = "/fake/bin/repo-remote-sso"
+
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (
+            '{"status":"error","message":"uplink-helper failed"}\n',
+            "debugging logs\n",
+        )
+        mock_process.returncode = 0
+        mock_popen.return_value = mock_process
+
+        with self.assertRaises(sync.SmartSyncError) as context:
+            self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+        self.assertIn(
+            "helper repo-remote-sso returned error: uplink-helper failed",
+            str(context.exception),
+        )
+        self.assertIn(
+            "Stderr was: debugging logs",
+            str(context.exception),
+        )
+
+
+class TestSmartSyncSetupBranch(unittest.TestCase):
+    """Tests for how _SmartSyncSetup picks the branch sent to the server."""
+
+    def setUp(self) -> None:
+        self.cmd = sync.Sync()
+        self.opt = mock.MagicMock()
+        self.opt.quiet = True
+        self.opt.smart_sync = True
+        self.opt.smart_tag = None
+        self.manifest = mock.MagicMock()
+        self.manifest.manifest_server = (
+            "http://android-smartsync.corp.google.com/manifestserver"
+        )
+        self.manifest.manifest_server_helper = None
+        self.smart_sync_manifest_path = "/fake/path/to/manifest.xml"
+        self.mock_server = mock.MagicMock()
+        self.mock_server.GetApprovedManifestV2.return_value = {
+            "success": True,
+            "manifest_xml": "<manifest></manifest>",
+        }
+        self.cmd._GetBranch = mock.MagicMock(return_value="main")
+        self.cmd._ReloadManifest = mock.MagicMock()
+        self.cmd._ResolveManifestServerTransport = mock.MagicMock(
+            return_value=(self.manifest.manifest_server, mock.MagicMock())
+        )
+
+    def _RunSetup(self, env: Dict[str, str]) -> str:
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "xmlrpc.client.Server", return_value=self.mock_server
+        ), mock.patch("builtins.open", mock.mock_open()):
+            return self.cmd._SmartSyncSetup(
+                self.opt, self.smart_sync_manifest_path, self.manifest
+            )
+
+    def test_default_branch(self) -> None:
+        """Without SYNC_BRANCH the manifest branch is used."""
+        self._RunSetup({})
+        self.cmd._GetBranch.assert_called_once_with(
+            self.manifest.manifestProject
+        )
+        self.mock_server.GetApprovedManifestV2.assert_called_once_with(
+            {"branch": "main"}
+        )
+
+    def test_sync_branch(self) -> None:
+        """SYNC_BRANCH replaces the manifest branch."""
+        self._RunSetup({"SYNC_BRANCH": "git_main-abfs"})
+        self.cmd._GetBranch.assert_not_called()
+        self.mock_server.GetApprovedManifestV2.assert_called_once_with(
+            {"branch": "git_main-abfs"}
+        )
+
+    def test_sync_branch_with_target(self) -> None:
+        """SYNC_BRANCH and SYNC_TARGET are both forwarded."""
+        self._RunSetup(
+            {
+                "SYNC_BRANCH": "git_main-abfs",
+                "SYNC_TARGET": "cf_x86_64_phone-trunk_staging-eng",
+            }
+        )
+        self.mock_server.GetApprovedManifestV2.assert_called_once_with(
+            {
+                "branch": "git_main-abfs",
+                "target": "cf_x86_64_phone-trunk_staging-eng",
+            }
+        )
+
+    def test_empty_sync_branch(self) -> None:
+        """An empty SYNC_BRANCH falls back to the manifest branch."""
+        self._RunSetup({"SYNC_BRANCH": ""})
+        self.cmd._GetBranch.assert_called_once_with(
+            self.manifest.manifestProject
+        )
+        self.mock_server.GetApprovedManifestV2.assert_called_once_with(
+            {"branch": "main"}
+        )
+
+
+class GetApprovedManifestTests(unittest.TestCase):
+    """Tests for _GetApprovedManifest."""
+
+    def test_request_with_target_and_best_effort(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.return_value = {
+            "success": True,
+            "manifest_xml": "<manifest/>",
+        }
+        result = sync._GetApprovedManifest(server, "main", "tgt", True)
+        self.assertEqual(result, (True, "<manifest/>"))
+        server.GetApprovedManifestV2.assert_called_once_with(
+            {"branch": "main", "target": "tgt", "best_effort": True}
+        )
+        server.GetApprovedManifest.assert_not_called()
+
+    def test_request_omits_unset_options(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.return_value = {
+            "success": True,
+            "manifest_xml": "<manifest/>",
+        }
+        sync._GetApprovedManifest(server, "main", None, False)
+        server.GetApprovedManifestV2.assert_called_once_with({"branch": "main"})
+
+    def test_declined(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.return_value = {
+            "success": False,
+            "error_message": "not in rollout",
+        }
+        result = sync._GetApprovedManifest(server, "main", None, True)
+        self.assertEqual(result, (False, "not in rollout"))
+
+    def test_invalid_response(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.return_value = [True, "<manifest/>"]
+        with self.assertRaises(sync.SmartSyncError):
+            sync._GetApprovedManifest(server, "main", None, False)
+
+    def test_success_missing_manifest(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.return_value = {"success": True}
+        with self.assertRaises(sync.SmartSyncError):
+            sync._GetApprovedManifest(server, "main", None, False)
+
+    def test_success_non_string_manifest(self) -> None:
+        server = mock.MagicMock()
+        for value in (None, 42, ["<manifest/>"]):
+            with self.subTest(manifest_xml=value):
+                server.GetApprovedManifestV2.return_value = {
+                    "success": True,
+                    "manifest_xml": value,
+                }
+                with self.assertRaises(sync.SmartSyncError):
+                    sync._GetApprovedManifest(server, "main", None, False)
+
+    def test_fallback_on_method_not_found_code(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.side_effect = xmlrpc.client.Fault(
+            -32601, "no such method"
+        )
+        server.GetApprovedManifest.return_value = [True, "<manifest/>"]
+        result = sync._GetApprovedManifest(server, "main", "tgt", True)
+        self.assertEqual(result, (True, "<manifest/>"))
+        server.GetApprovedManifest.assert_called_once_with("main", "tgt")
+
+    def test_other_fault_is_not_retried(self) -> None:
+        server = mock.MagicMock()
+        server.GetApprovedManifestV2.side_effect = xmlrpc.client.Fault(
+            1, "internal error"
+        )
+        with self.assertRaises(xmlrpc.client.Fault):
+            sync._GetApprovedManifest(server, "main", "tgt", False)
+        server.GetApprovedManifest.assert_not_called()
+
+
+@contextlib.contextmanager
+def _LiveManifestServer(**funcs: Any) -> Iterator[xmlrpc.client.ServerProxy]:
+    """Runs a local XML-RPC server exposing |funcs|."""
+    server = xmlrpc.server.SimpleXMLRPCServer(
+        ("127.0.0.1", 0), logRequests=False
+    )
+    for name, func in funcs.items():
+        server.register_function(func, name)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield xmlrpc.client.ServerProxy(f"http://{host}:{port}/")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class GetApprovedManifestLiveTests(unittest.TestCase):
+    """Tests _GetApprovedManifest against a real XML-RPC server."""
+
+    def test_legacy_server_fallback(self) -> None:
+        calls = []
+
+        def legacy(*args: str) -> List[Any]:
+            calls.append(args)
+            return [True, "<manifest/>"]
+
+        with _LiveManifestServer(GetApprovedManifest=legacy) as proxy:
+            self.assertEqual(
+                sync._GetApprovedManifest(proxy, "main", "tgt", True),
+                (True, "<manifest/>"),
+            )
+            self.assertEqual(
+                sync._GetApprovedManifest(proxy, "main", None, True),
+                (True, "<manifest/>"),
+            )
+        self.assertEqual(calls, [("main", "tgt"), ("main",)])
+
+    def test_v2_server(self) -> None:
+        requests = []
+
+        def v2(request: Dict[str, Any]) -> Dict[str, Any]:
+            requests.append(request)
+            return {"success": False, "error_message": "declined"}
+
+        with _LiveManifestServer(GetApprovedManifestV2=v2) as proxy:
+            self.assertEqual(
+                sync._GetApprovedManifest(proxy, "main", None, True),
+                (False, "declined"),
+            )
+        self.assertEqual(requests, [{"branch": "main", "best_effort": True}])
