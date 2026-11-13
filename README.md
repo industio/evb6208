@@ -18,7 +18,7 @@
 
 ## 📚 Full Documentation
 
-All detailed documents (including Linux, Docker, LVGL, MAC flashing , etc.) have been organized in the **Wiki**:
+All detailed documents (including Linux, Docker, MAC flashing , etc.) have been organized in the **Wiki**:
 
 👉 **https://github.com/industio/evb6208/wiki**
 
