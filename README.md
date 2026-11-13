@@ -1,6 +1,6 @@
 # IDO-EVB6208
 
-> A SparkLink development board based on the Rockchip RK3506 series industrial SoC, integrating a 3-core Cortex-A7 + Cortex-M0 heterogeneous multi-core processor, supporting dual 100M Ethernet ports, CAN FD, SparkLink (WiFi/BLE/SLE tri-mode), and 4G Cat1. It is suitable for scenarios such as industrial gateways, HMI, PLC, and handheld terminals.
+> An evaluation board based on the Rockchip RK3562 (Quad-core ARM Cortex-A53, up to 2.0GHz), supporting up to 8GB of memory, integrating an independent NPU for lightweight AI applications, and supporting PCIe 2.1, USB 3.0 OTG, dual Ethernet ports, and multiple video I/O interfaces. It is suitable for scenarios such as IoT gateways, tablet PCs, smart homes, educational electronics, industrial displays, and industrial control.
 
 ## ✨ Core Features
 
