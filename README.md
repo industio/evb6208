@@ -28,6 +28,6 @@ All detailed documents (including Linux, Docker, LVGL, MAC flashing , etc.) have
 | :--- | :--- |
 | Core Board | IDO-SOM6208-B1 |
 | Development Board | IDO-EVB6208-V1 |
-| SoC | RK3562J |
+| SoC | RK3562 |
 
 ## 📄 License
