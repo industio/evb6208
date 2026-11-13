@@ -4,11 +4,11 @@
 
 ## ✨ Core Features
 
-- **Heterogeneous Multi-Core**: 3 × Cortex-A7 (1.5GHz) + 1 × Cortex-M0 (200MHz)
-- **All-Round Connectivity**: 2 × 100M Ethernet ports, 4G Cat1, SparkLink 2.4GHz (WiFi + BLE + SLE)
-- **Industrial Interfaces**: 2 × CAN FD, 5 × serial ports, USB2.0 OTG, RGB / MIPI-DSI display
-- **Software Ecosystem**: Linux Kernel 6.1 SDK, supporting Ubuntu Base / Buildroot;
-- **Core Board + Base Board Architecture**: Core board model IDO-SOM3506-S1
+- **High-Performance SoC**: 4 × Cortex-A53 (2.0GHz), integrated ARM G52 2EE GPU,built-in 1 TOPS NPU
+- **All-Round Connectivity**: 2 × Gigabit Ethernet ports (RGMII + PCIe), Wi-Fi 6 (802.11ax) + Bluetooth 5.4
+- **Rich Multimedia**: 1 × MIPI DSI / HDMI (multiplexed), 2 × 4-Lane MIPI CSI, 4K 30fps H.265/H.264 decoding, 13M ISP
+- **Software Ecosystem**: Linux Kernel 5.10 SDK, supporting Ubuntu Base/ Debian / Buildroot / Android;
+- **Core Board + Base Board Architecture**: Core board model IDO-SOM6208-B1
 
 ## 🚀 Quick Start
 
